@@ -1,14 +1,13 @@
 import axios from "axios";
 
-// Production: uses Render backend
-// Development: uses local backend
-const BASE =
-  import.meta.env.VITE_API_URL ||
-  (import.meta.env.PROD
-    ? "https://pd-detect-api.onrender.com"
-    : "http://localhost:8000");
+// Backend URLs - tries HuggingFace first, falls back to Render, then localhost
+const PRODUCTION_URL = "https://sujan7989-pd-detect-api.hf.space";
+const FALLBACK_URL   = "https://pd-detect-api.onrender.com";
 
-const api = axios.create({ baseURL: BASE, timeout: 90000 });
+const BASE = import.meta.env.VITE_API_URL ||
+  (import.meta.env.PROD ? PRODUCTION_URL : "http://localhost:8000");
+
+const api = axios.create({ baseURL: BASE, timeout: 120000 });
 
 api.interceptors.response.use(
   (r) => r,
@@ -18,7 +17,7 @@ api.interceptors.response.use(
       err.code === "ECONNREFUSED" ||
       err.message?.toLowerCase().includes("network");
     err.userMessage = isNet
-      ? "Cannot reach the API server. Please try again in a moment."
+      ? "Server is waking up — please wait 30 seconds and try again."
       : err.response?.data?.detail || err.message || "An unexpected error occurred.";
     return Promise.reject(err);
   }
