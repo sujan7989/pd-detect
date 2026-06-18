@@ -1,256 +1,416 @@
 """
-Audio feature extraction for Parkinson's Disease Detection.
-Extracts ~60 acoustic features from voice recordings.
+Lightweight audio feature extraction — no librosa/numba dependency.
+Uses only scipy + numpy for <200MB RAM footprint on free hosting.
 """
 
 import numpy as np
-import librosa
 import soundfile as sf
 import io
 import warnings
 warnings.filterwarnings("ignore")
 
+# ── scipy imports (lazy, to keep startup fast) ─────────────────────────────
+from scipy.signal import resample_poly
+from scipy.fft import rfft, rfftfreq
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PUBLIC ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════
 
 def extract_features(audio_bytes: bytes, sr_target: int = 22050) -> dict:
     """
-    Extract acoustic features from audio bytes.
-    Returns a dictionary of ~60 features used for PD detection.
+    Extract ~60 acoustic features from raw audio bytes.
+    Returns a flat dict suitable for feeding into the UCI-mapped ML model.
     """
-    # Load audio from bytes
-    audio_io = io.BytesIO(audio_bytes)
-    try:
-        y, sr = sf.read(audio_io)
-        # Convert stereo to mono
-        if y.ndim > 1:
-            y = np.mean(y, axis=1)
-        # Resample if needed
-        if sr != sr_target:
-            y = librosa.resample(y, orig_sr=sr, target_sr=sr_target)
-            sr = sr_target
-    except Exception:
-        # Fallback: try librosa directly
-        audio_io.seek(0)
-        y, sr = librosa.load(audio_io, sr=sr_target, mono=True)
+    y, sr = _load_audio(audio_bytes, sr_target)
 
-    # Ensure float32
-    y = y.astype(np.float32)
-    # Remove silence
-    y, _ = librosa.effects.trim(y, top_db=20)
-    if len(y) < sr * 0.1:
-        raise ValueError("Audio too short for analysis (< 0.1 seconds after trimming).")
+    features: dict = {}
 
-    features = {}
-
-    # ── 1. MFCCs (13) + deltas (13) + delta-deltas (13) = 39 features ──
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-    mfcc_delta = librosa.feature.delta(mfcc)
-    mfcc_delta2 = librosa.feature.delta(mfcc, order=2)
-
+    # 1. MFCCs (13 coefficients + deltas + delta-deltas = 39 features)
+    mfcc, mfcc_d, mfcc_d2 = _compute_mfcc(y, sr, n_mfcc=13)
     for i in range(13):
-        features[f"mfcc_{i+1}_mean"] = float(np.mean(mfcc[i]))
-        features[f"mfcc_delta_{i+1}_mean"] = float(np.mean(mfcc_delta[i]))
-        features[f"mfcc_delta2_{i+1}_mean"] = float(np.mean(mfcc_delta2[i]))
+        features[f"mfcc_{i+1}_mean"]       = float(np.mean(mfcc[i]))
+        features[f"mfcc_delta_{i+1}_mean"] = float(np.mean(mfcc_d[i]))
+        features[f"mfcc_delta2_{i+1}_mean"]= float(np.mean(mfcc_d2[i]))
 
-    # ── 2. Pitch (fundamental frequency) ──
-    f0, voiced_flag, voiced_probs = librosa.pyin(
-        y,
-        fmin=librosa.note_to_hz("C2"),
-        fmax=librosa.note_to_hz("C7"),
-        sr=sr,
-    )
-    voiced_f0 = f0[voiced_flag & ~np.isnan(f0)]
-    if len(voiced_f0) < 2:
-        voiced_f0 = np.array([150.0, 155.0])  # fallback
+    # 2. Pitch (fundamental frequency via autocorrelation)
+    f0 = _extract_pitch(y, sr)
+    voiced = f0[f0 > 0]
+    if len(voiced) < 2:
+        voiced = np.array([150.0, 152.0])
+    features["pitch_mean"] = float(np.mean(voiced))
+    features["pitch_std"]  = float(np.std(voiced))
 
-    features["pitch_mean"] = float(np.mean(voiced_f0))
-    features["pitch_std"] = float(np.std(voiced_f0))
-
-    # ── 3. Jitter (period-to-period variation in pitch) ──
-    # Compute periods from f0 contour
-    periods = 1.0 / voiced_f0[voiced_f0 > 0]
+    # 3. Jitter (period irregularity from F0 contour)
+    periods = 1.0 / voiced[voiced > 0]
     if len(periods) < 2:
-        periods = np.array([1 / 150.0, 1 / 155.0])
+        periods = np.array([1/150.0, 1/152.0])
+    features["jitter_local"]    = _jitter_local(periods)
+    features["jitter_absolute"] = float(np.mean(np.abs(np.diff(periods))))
+    features["jitter_rap"]      = _jitter_rap(periods)
+    features["jitter_ppq5"]     = _jitter_ppq(periods, 5)
+    features["jitter_ddp"]      = features["jitter_rap"] * 3.0
 
-    jitter_local = _jitter_local(periods)
-    jitter_absolute = float(np.mean(np.abs(np.diff(periods))))
-    jitter_rap = _jitter_rap(periods)
-    jitter_ppq5 = _jitter_ppq(periods, ppq=5)
-    jitter_ddp = jitter_rap * 3  # DDP = 3 * RAP
+    # 4. Shimmer (amplitude irregularity from RMS frames)
+    frame_len = int(sr * 0.025)
+    hop_len   = int(sr * 0.010)
+    rms = _frame_rms(y, frame_len, hop_len)
+    rms = rms[rms > 1e-8]
+    if len(rms) < 2:
+        rms = np.array([0.05, 0.052])
+    features["shimmer_local"] = _shimmer_local(rms)
+    features["shimmer_db"]    = _shimmer_db(rms)
+    features["shimmer_apq3"]  = _shimmer_apq(rms, 3)
+    features["shimmer_apq5"]  = _shimmer_apq(rms, 5)
+    features["shimmer_apq11"] = _shimmer_apq(rms, 11)
+    features["shimmer_dda"]   = features["shimmer_apq3"] * 3.0
 
-    features["jitter_local"] = jitter_local
-    features["jitter_absolute"] = jitter_absolute
-    features["jitter_rap"] = jitter_rap
-    features["jitter_ppq5"] = jitter_ppq5
-    features["jitter_ddp"] = jitter_ddp
+    # 5. HNR
+    features["hnr"] = _compute_hnr(y, sr)
 
-    # ── 4. Shimmer (amplitude variation) ──
-    # Use RMS of short frames as amplitude proxy
-    frame_length = int(sr * 0.025)  # 25ms frames
-    hop_length = int(sr * 0.010)    # 10ms hop
-    rms_frames = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-    rms_frames = rms_frames[rms_frames > 0]
-    if len(rms_frames) < 2:
-        rms_frames = np.array([0.05, 0.055])
-
-    shimmer_local = _shimmer_local(rms_frames)
-    shimmer_db = _shimmer_db(rms_frames)
-    shimmer_apq3 = _shimmer_apq(rms_frames, apq=3)
-    shimmer_apq5 = _shimmer_apq(rms_frames, apq=5)
-    shimmer_apq11 = _shimmer_apq(rms_frames, apq=11)
-    shimmer_dda = shimmer_apq3 * 3
-
-    features["shimmer_local"] = shimmer_local
-    features["shimmer_db"] = shimmer_db
-    features["shimmer_apq3"] = shimmer_apq3
-    features["shimmer_apq5"] = shimmer_apq5
-    features["shimmer_apq11"] = shimmer_apq11
-    features["shimmer_dda"] = shimmer_dda
-
-    # ── 5. HNR (Harmonic to Noise Ratio) ──
-    hnr = _compute_hnr(y, sr)
-    features["hnr"] = hnr
-
-    # ── 6. ZCR (Zero Crossing Rate) ──
-    zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame_length, hop_length=hop_length)[0]
+    # 6. ZCR
+    zcr = _zero_crossing_rate(y, frame_len, hop_len)
     features["zcr_mean"] = float(np.mean(zcr))
-    features["zcr_std"] = float(np.std(zcr))
+    features["zcr_std"]  = float(np.std(zcr))
 
-    # ── 7. Spectral features ──
-    spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-    spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
-    spectral_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
+    # 7. Spectral features
+    spec_c, spec_r, spec_b = _spectral_features(y, sr)
+    features["spectral_centroid_mean"]  = float(np.mean(spec_c))
+    features["spectral_centroid_std"]   = float(np.std(spec_c))
+    features["spectral_rolloff_mean"]   = float(np.mean(spec_r))
+    features["spectral_rolloff_std"]    = float(np.std(spec_r))
+    features["spectral_bandwidth_mean"] = float(np.mean(spec_b))
+    features["spectral_bandwidth_std"]  = float(np.std(spec_b))
 
-    features["spectral_centroid_mean"] = float(np.mean(spectral_centroid))
-    features["spectral_centroid_std"] = float(np.std(spectral_centroid))
-    features["spectral_rolloff_mean"] = float(np.mean(spectral_rolloff))
-    features["spectral_rolloff_std"] = float(np.std(spectral_rolloff))
-    features["spectral_bandwidth_mean"] = float(np.mean(spectral_bandwidth))
-    features["spectral_bandwidth_std"] = float(np.std(spectral_bandwidth))
-
-    # ── 8. RMS Energy ──
-    rms_full = librosa.feature.rms(y=y)[0]
+    # 8. RMS energy
+    rms_full = _frame_rms(y, 2048, 512)
     features["rms_mean"] = float(np.mean(rms_full))
-    features["rms_std"] = float(np.std(rms_full))
+    features["rms_std"]  = float(np.std(rms_full))
 
-    # ── 9. Additional voicing / nonlinear features ──
-    # RPDE proxy: entropy of autocorrelation
-    features["rpde"] = _rpde_proxy(y, sr)
-    # DFA proxy: spectral slope
-    features["dfa"] = _dfa_proxy(y, sr)
-    # Spread1 / Spread2 / PPE (UCI dataset features)
-    features["spread1"] = float(np.log(features["pitch_std"] + 1e-6))
-    features["spread2"] = float(np.log(jitter_local + 1e-6))
-    features["ppe"] = float(np.log(shimmer_local + 1e-6))
+    # 9. Nonlinear / derived features
+    features["rpde"]    = _rpde_proxy(y, sr)
+    features["dfa"]     = _dfa_proxy(y, sr)
+    features["spread1"] = float(np.log(features["pitch_std"] + 1e-8))
+    features["spread2"] = float(np.log(features["jitter_local"] + 1e-8))
+    features["ppe"]     = float(np.log(features["shimmer_local"] + 1e-8))
 
     return features
 
 
-# ── Helper functions ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  AUDIO LOADING
+# ═══════════════════════════════════════════════════════════════════════════
 
-def _jitter_local(periods: np.ndarray) -> float:
-    """Local jitter: mean absolute period difference / mean period."""
-    if len(periods) < 2:
-        return 0.0
-    diffs = np.abs(np.diff(periods))
-    return float(np.mean(diffs) / (np.mean(periods) + 1e-10))
+def _load_audio(audio_bytes: bytes, sr_target: int) -> tuple:
+    buf = io.BytesIO(audio_bytes)
+    try:
+        y, sr = sf.read(buf)
+        if y.ndim > 1:
+            y = np.mean(y, axis=1)
+        y = y.astype(np.float32)
+        if sr != sr_target:
+            gcd = np.gcd(sr_target, sr)
+            y   = resample_poly(y, sr_target // gcd, sr // gcd).astype(np.float32)
+            sr  = sr_target
+    except Exception:
+        # Fallback: try reading as raw PCM 16-bit mono
+        buf.seek(0)
+        raw = np.frombuffer(buf.read(), dtype=np.int16)
+        y   = (raw / 32768.0).astype(np.float32)
+        sr  = sr_target
 
+    # Trim silence (simple energy threshold)
+    energy = y ** 2
+    mask   = energy > 1e-6
+    if mask.any():
+        start, end = np.argmax(mask), len(mask) - np.argmax(mask[::-1])
+        y = y[start:end]
 
-def _jitter_rap(periods: np.ndarray) -> float:
-    """RAP jitter: 3-point smoothed."""
-    if len(periods) < 3:
-        return 0.0
-    smoothed = np.convolve(periods, np.ones(3) / 3, mode="valid")
-    n = len(smoothed)
-    diffs = np.abs(periods[1 : n + 1] - smoothed)
-    return float(np.mean(diffs) / (np.mean(periods) + 1e-10))
+    if len(y) < sr * 0.1:
+        raise ValueError("Audio too short for analysis (< 0.1 s after trimming).")
 
-
-def _jitter_ppq(periods: np.ndarray, ppq: int = 5) -> float:
-    """PPQ jitter."""
-    if len(periods) < ppq:
-        return 0.0
-    smoothed = np.convolve(periods, np.ones(ppq) / ppq, mode="valid")
-    n = len(smoothed)
-    half = ppq // 2
-    diffs = np.abs(periods[half : half + n] - smoothed)
-    return float(np.mean(diffs) / (np.mean(periods) + 1e-10))
-
-
-def _shimmer_local(amplitudes: np.ndarray) -> float:
-    """Local shimmer: mean absolute amplitude difference / mean amplitude."""
-    if len(amplitudes) < 2:
-        return 0.0
-    diffs = np.abs(np.diff(amplitudes))
-    return float(np.mean(diffs) / (np.mean(amplitudes) + 1e-10))
+    return y, sr
 
 
-def _shimmer_db(amplitudes: np.ndarray) -> float:
-    """Shimmer in dB."""
-    if len(amplitudes) < 2:
-        return 0.0
-    ratios = amplitudes[1:] / (amplitudes[:-1] + 1e-10)
-    return float(np.mean(np.abs(20 * np.log10(ratios + 1e-10))))
+# ═══════════════════════════════════════════════════════════════════════════
+#  MFCC  (pure numpy, no numba/librosa required)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _mel_filterbank(sr: int, n_fft: int, n_mels: int = 40,
+                    f_min: float = 20.0, f_max: float = None) -> np.ndarray:
+    if f_max is None:
+        f_max = sr / 2.0
+
+    def hz_to_mel(hz):   return 2595 * np.log10(1 + hz / 700)
+    def mel_to_hz(mel):  return 700 * (10 ** (mel / 2595) - 1)
+
+    mel_min  = hz_to_mel(f_min)
+    mel_max  = hz_to_mel(f_max)
+    mel_pts  = np.linspace(mel_min, mel_max, n_mels + 2)
+    hz_pts   = mel_to_hz(mel_pts)
+    bin_pts  = np.floor((n_fft + 1) * hz_pts / sr).astype(int)
+
+    fb = np.zeros((n_mels, n_fft // 2 + 1))
+    for m in range(1, n_mels + 1):
+        lo, ctr, hi = bin_pts[m-1], bin_pts[m], bin_pts[m+1]
+        for k in range(lo, ctr):
+            if ctr != lo:
+                fb[m-1, k] = (k - lo) / (ctr - lo)
+        for k in range(ctr, hi):
+            if hi != ctr:
+                fb[m-1, k] = (hi - k) / (hi - ctr)
+    return fb
 
 
-def _shimmer_apq(amplitudes: np.ndarray, apq: int = 3) -> float:
-    """APQ shimmer."""
-    if len(amplitudes) < apq:
-        return 0.0
-    smoothed = np.convolve(amplitudes, np.ones(apq) / apq, mode="valid")
-    n = len(smoothed)
-    half = apq // 2
-    diffs = np.abs(amplitudes[half : half + n] - smoothed)
-    return float(np.mean(diffs) / (np.mean(amplitudes) + 1e-10))
+def _compute_mfcc(y: np.ndarray, sr: int, n_mfcc: int = 13):
+    n_fft    = 2048
+    hop_len  = 512
+    n_mels   = 40
+    window   = np.hanning(n_fft)
+    fb       = _mel_filterbank(sr, n_fft, n_mels)
+
+    # STFT power spectrum
+    n_frames = (len(y) - n_fft) // hop_len + 1
+    if n_frames < 1:
+        n_frames = 1
+    pow_spec = np.zeros((n_fft // 2 + 1, n_frames))
+    for i in range(n_frames):
+        start = i * hop_len
+        frame = y[start: start + n_fft]
+        if len(frame) < n_fft:
+            frame = np.pad(frame, (0, n_fft - len(frame)))
+        windowed = frame * window
+        fft_out  = rfft(windowed)
+        pow_spec[:, i] = np.abs(fft_out) ** 2
+
+    # Mel spectrum → log
+    mel_spec = fb @ pow_spec
+    log_mel  = np.log(mel_spec + 1e-9)
+
+    # DCT-II
+    n_m = log_mel.shape[0]
+    dct_mat = np.zeros((n_mfcc, n_m))
+    for k in range(n_mfcc):
+        dct_mat[k] = np.cos(np.pi * k / n_m * (np.arange(n_m) + 0.5))
+    mfcc = dct_mat @ log_mel  # shape (n_mfcc, n_frames)
+
+    # Delta & delta-delta
+    def delta(x, w=9):
+        pad = w // 2
+        x_p = np.pad(x, ((0, 0), (pad, pad)), mode="edge")
+        denom = 2 * sum(t**2 for t in range(1, pad+1))
+        d = np.zeros_like(x)
+        for t in range(x.shape[1]):
+            d[:, t] = sum(n * (x_p[:, t+pad+n] - x_p[:, t+pad-n])
+                          for n in range(1, pad+1)) / (denom + 1e-9)
+        return d
+
+    mfcc_d  = delta(mfcc)
+    mfcc_d2 = delta(mfcc_d)
+    return mfcc, mfcc_d, mfcc_d2
 
 
-def _compute_hnr(y: np.ndarray, sr: int) -> float:
-    """
-    Approximate HNR using autocorrelation method.
-    """
-    frame_len = int(sr * 0.04)  # 40ms
-    hop = int(sr * 0.01)
-    hnr_vals = []
-    for start in range(0, len(y) - frame_len, hop):
-        frame = y[start : start + frame_len]
+# ═══════════════════════════════════════════════════════════════════════════
+#  PITCH EXTRACTION  (autocorrelation method)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _extract_pitch(y: np.ndarray, sr: int,
+                   f_min: float = 75.0, f_max: float = 500.0) -> np.ndarray:
+    frame_len = int(sr * 0.04)   # 40 ms
+    hop_len   = int(sr * 0.01)   # 10 ms
+    lag_min   = int(sr / f_max)
+    lag_max   = int(sr / f_min)
+    n_frames  = (len(y) - frame_len) // hop_len + 1
+    f0 = np.zeros(max(n_frames, 1))
+
+    for i in range(n_frames):
+        frame = y[i * hop_len: i * hop_len + frame_len]
+        if len(frame) < frame_len:
+            break
+        # Normalize
+        frame = frame - np.mean(frame)
         if np.max(np.abs(frame)) < 1e-6:
             continue
-        # Autocorrelation
-        ac = np.correlate(frame, frame, mode="full")
-        ac = ac[len(ac) // 2 :]
-        # Find first peak after zero (fundamental period)
-        min_period = int(sr / 500)  # max 500 Hz
-        max_period = int(sr / 75)   # min 75 Hz
-        if max_period >= len(ac):
+        # Autocorrelation via FFT
+        n   = len(frame)
+        fa  = rfft(frame, n=n * 2)
+        ac  = np.real(np.fft.irfft(fa * np.conj(fa)))[:n]
+        # Normalize by zero-lag
+        if ac[0] <= 0:
             continue
-        peak_idx = np.argmax(ac[min_period:max_period]) + min_period
-        r0 = ac[0]
-        r1 = ac[peak_idx]
-        if r0 <= 0 or r1 <= 0:
+        ac /= ac[0]
+        # Find peak in valid lag range
+        if lag_max >= len(ac):
+            lag_max = len(ac) - 1
+        segment = ac[lag_min: lag_max]
+        if len(segment) == 0:
             continue
-        hnr_val = 10 * np.log10(r1 / (r0 - r1 + 1e-10) + 1e-10)
-        hnr_vals.append(float(np.clip(hnr_val, -20, 40)))
+        peak_idx = np.argmax(segment) + lag_min
+        if ac[peak_idx] > 0.3:          # voiced threshold
+            f0[i] = sr / peak_idx
+
+    return f0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  JITTER helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _jitter_local(p: np.ndarray) -> float:
+    if len(p) < 2: return 0.0
+    return float(np.mean(np.abs(np.diff(p))) / (np.mean(p) + 1e-10))
+
+def _jitter_rap(p: np.ndarray) -> float:
+    if len(p) < 3: return 0.0
+    sm = np.convolve(p, np.ones(3)/3, "valid")
+    n  = len(sm)
+    return float(np.mean(np.abs(p[1:n+1] - sm)) / (np.mean(p) + 1e-10))
+
+def _jitter_ppq(p: np.ndarray, q: int) -> float:
+    if len(p) < q: return 0.0
+    sm   = np.convolve(p, np.ones(q)/q, "valid")
+    half = q // 2
+    n    = len(sm)
+    return float(np.mean(np.abs(p[half:half+n] - sm)) / (np.mean(p) + 1e-10))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SHIMMER helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _shimmer_local(a: np.ndarray) -> float:
+    if len(a) < 2: return 0.0
+    return float(np.mean(np.abs(np.diff(a))) / (np.mean(a) + 1e-10))
+
+def _shimmer_db(a: np.ndarray) -> float:
+    if len(a) < 2: return 0.0
+    r = a[1:] / (a[:-1] + 1e-10)
+    return float(np.mean(np.abs(20 * np.log10(r + 1e-10))))
+
+def _shimmer_apq(a: np.ndarray, q: int) -> float:
+    if len(a) < q: return 0.0
+    sm   = np.convolve(a, np.ones(q)/q, "valid")
+    half = q // 2
+    n    = len(sm)
+    return float(np.mean(np.abs(a[half:half+n] - sm)) / (np.mean(a) + 1e-10))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FRAME RMS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _frame_rms(y: np.ndarray, frame_len: int, hop_len: int) -> np.ndarray:
+    n_frames = (len(y) - frame_len) // hop_len + 1
+    if n_frames < 1: return np.array([np.sqrt(np.mean(y**2))])
+    out = np.zeros(n_frames)
+    for i in range(n_frames):
+        frame = y[i*hop_len: i*hop_len + frame_len]
+        out[i] = np.sqrt(np.mean(frame**2) + 1e-10)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HNR
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _compute_hnr(y: np.ndarray, sr: int) -> float:
+    frame_len = int(sr * 0.04)
+    hop_len   = int(sr * 0.01)
+    lag_min   = int(sr / 500)
+    lag_max   = int(sr / 75)
+    hnr_vals  = []
+
+    for i in range(0, len(y) - frame_len, hop_len):
+        frame = y[i: i + frame_len]
+        frame = frame - np.mean(frame)
+        if np.max(np.abs(frame)) < 1e-6: continue
+        n  = len(frame)
+        fa = rfft(frame, n=n*2)
+        ac = np.real(np.fft.irfft(fa * np.conj(fa)))[:n]
+        if ac[0] <= 0: continue
+        if lag_max >= len(ac): continue
+        peak_idx = np.argmax(ac[lag_min:lag_max]) + lag_min
+        r0, r1   = ac[0], ac[peak_idx]
+        if r0 <= 0 or r1 <= 0: continue
+        val = 10 * np.log10(r1 / (r0 - r1 + 1e-9) + 1e-9)
+        hnr_vals.append(float(np.clip(val, -20, 40)))
+
     return float(np.mean(hnr_vals)) if hnr_vals else 15.0
 
 
-def _rpde_proxy(y: np.ndarray, sr: int) -> float:
-    """Proxy for RPDE: normalized autocorrelation entropy."""
-    ac = np.correlate(y[:min(len(y), sr)], y[:min(len(y), sr)], mode="full")
-    ac = np.abs(ac[len(ac) // 2 :])
-    ac = ac / (ac[0] + 1e-10)
-    ac = ac[:500]
-    ac = np.clip(ac, 1e-10, 1)
-    entropy = -np.sum(ac * np.log(ac)) / len(ac)
-    return float(np.clip(entropy, 0, 1))
+# ═══════════════════════════════════════════════════════════════════════════
+#  ZCR
+# ═══════════════════════════════════════════════════════════════════════════
 
+def _zero_crossing_rate(y: np.ndarray, frame_len: int, hop_len: int) -> np.ndarray:
+    n_frames = (len(y) - frame_len) // hop_len + 1
+    if n_frames < 1: return np.array([0.0])
+    out = np.zeros(n_frames)
+    for i in range(n_frames):
+        frame   = y[i*hop_len: i*hop_len + frame_len]
+        out[i]  = np.sum(np.abs(np.diff(np.sign(frame)))) / (2.0 * frame_len)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SPECTRAL FEATURES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _spectral_features(y: np.ndarray, sr: int):
+    n_fft    = 2048
+    hop_len  = 512
+    window   = np.hanning(n_fft)
+    n_frames = (len(y) - n_fft) // hop_len + 1
+    if n_frames < 1: n_frames = 1
+    freqs = rfftfreq(n_fft, 1.0 / sr)
+
+    centroids  = []
+    rolloffs   = []
+    bandwidths = []
+
+    for i in range(n_frames):
+        start = i * hop_len
+        frame = y[start: start + n_fft]
+        if len(frame) < n_fft:
+            frame = np.pad(frame, (0, n_fft - len(frame)))
+        mag = np.abs(rfft(frame * window))
+        mag_sum = np.sum(mag) + 1e-10
+
+        # Centroid
+        centroid = float(np.sum(freqs * mag) / mag_sum)
+        centroids.append(centroid)
+
+        # Rolloff (85%)
+        cumsum = np.cumsum(mag)
+        thresh = 0.85 * cumsum[-1]
+        idx    = np.searchsorted(cumsum, thresh)
+        rolloffs.append(float(freqs[min(idx, len(freqs)-1)]))
+
+        # Bandwidth
+        bw = float(np.sqrt(np.sum(((freqs - centroid) ** 2) * mag) / mag_sum))
+        bandwidths.append(bw)
+
+    return np.array(centroids), np.array(rolloffs), np.array(bandwidths)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  NONLINEAR PROXIES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _rpde_proxy(y: np.ndarray, sr: int) -> float:
+    """Entropy of normalized autocorrelation — proxy for RPDE."""
+    n   = min(len(y), sr)
+    fa  = rfft(y[:n])
+    ac  = np.abs(np.fft.irfft(fa * np.conj(fa)))[:500]
+    ac  = np.clip(ac / (ac[0] + 1e-10), 1e-10, 1)
+    ent = -np.sum(ac * np.log(ac)) / len(ac)
+    return float(np.clip(ent, 0, 1))
 
 def _dfa_proxy(y: np.ndarray, sr: int) -> float:
-    """Proxy for DFA: spectral flatness as complexity measure."""
-    n = min(len(y), sr * 2)
-    spec = np.abs(np.fft.rfft(y[:n]))
-    spec = spec[spec > 0]
-    if len(spec) == 0:
-        return 0.7
-    geo_mean = np.exp(np.mean(np.log(spec + 1e-10)))
-    arith_mean = np.mean(spec)
-    flatness = float(geo_mean / (arith_mean + 1e-10))
-    return float(np.clip(flatness, 0, 1))
+    """Spectral flatness — proxy for DFA."""
+    n   = min(len(y), sr * 2)
+    mag = np.abs(rfft(y[:n])) + 1e-10
+    geo = np.exp(np.mean(np.log(mag)))
+    arith = np.mean(mag)
+    return float(np.clip(geo / (arith + 1e-10), 0, 1))
