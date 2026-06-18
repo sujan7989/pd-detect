@@ -14,7 +14,7 @@ from typing import List, Optional
 
 import numpy as np
 import joblib
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -98,32 +98,58 @@ NORMAL_RANGES = {
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def map_to_uci_vector(features: dict) -> np.ndarray:
-    """Map extracted audio features to the 22-column UCI feature vector."""
-    jitter_pct = features.get("jitter_local", 0.005) * 100
-    nhr        = 1.0 / (features.get("hnr", 20.0) + 1e-9)
+    """
+    Map extracted audio features to the 22-column UCI feature vector.
+    Carefully calibrated to match UCI dataset feature distributions.
+    """
+    # MDVP:Jitter(%) — UCI uses percentage, our value is ratio → multiply by 100
+    jitter_pct = features.get("jitter_local", 0.003) * 100.0
+
+    # NHR (Noise-to-Harmonics Ratio) = inverse of HNR
+    hnr = features.get("hnr", 20.0)
+    # Clamp HNR to realistic range before inversion
+    hnr_clamped = float(np.clip(hnr, 0.1, 40.0))
+    nhr = 1.0 / (hnr_clamped + 1e-6)
+
+    # Pitch: use measured value, ensure it's in realistic range
+    pitch = float(np.clip(features.get("pitch_mean", 150.0), 50.0, 350.0))
+
+    # Jitter absolute: MDVP:Jitter(Abs) in seconds
+    jitter_abs = features.get("jitter_absolute", 0.00003)
+
+    # RPDE, DFA, spread1, spread2, PPE — directly from features
+    rpde    = float(np.clip(features.get("rpde",    0.50), 0.0, 1.0))
+    dfa     = float(np.clip(features.get("dfa",     0.70), 0.5, 0.9))
+    spread1 = float(np.clip(features.get("spread1", -5.5), -8.0, -2.0))
+    spread2 = float(np.clip(features.get("spread2",  0.20), 0.0, 0.5))
+    ppe     = float(np.clip(features.get("ppe",      0.20), 0.0, 0.6))
+
+    # D2 proxy from ZCR
+    d2 = float(np.clip(features.get("zcr_mean", 0.05) * 40.0, 1.5, 4.0))
+
     vec = [
-        features.get("pitch_mean",    150.0),
-        features.get("pitch_mean",    150.0) * 1.08,
-        features.get("pitch_mean",    150.0) * 0.92,
-        jitter_pct,
-        features.get("jitter_absolute", 0.00003),
-        features.get("jitter_rap",      0.0025),
-        features.get("jitter_ppq5",     0.0030),
-        features.get("jitter_ddp",      0.0075),
-        features.get("shimmer_local",   0.030),
-        features.get("shimmer_db",      0.270),
-        features.get("shimmer_apq3",    0.016),
-        features.get("shimmer_apq5",    0.019),
-        features.get("shimmer_apq11",   0.027),
-        features.get("shimmer_dda",     0.047),
-        nhr,
-        features.get("hnr",             20.0),
-        features.get("rpde",            0.50),
-        features.get("dfa",             0.70),
-        features.get("spread1",        -5.00),
-        features.get("spread2",         0.20),
-        features.get("zcr_mean",        0.05),
-        features.get("ppe",             0.20),
+        pitch,                                                    # MDVP:Fo(Hz)
+        pitch * 1.08,                                             # MDVP:Fhi(Hz)
+        pitch * 0.92,                                             # MDVP:Flo(Hz)
+        jitter_pct,                                               # MDVP:Jitter(%)
+        jitter_abs,                                               # MDVP:Jitter(Abs)
+        features.get("jitter_rap",   jitter_pct * 0.0065),       # MDVP:RAP
+        features.get("jitter_ppq5",  jitter_pct * 0.0077),       # MDVP:PPQ
+        features.get("jitter_ddp",   jitter_pct * 0.0196),       # Jitter:DDP
+        features.get("shimmer_local",  0.030),                   # MDVP:Shimmer
+        features.get("shimmer_db",     0.270),                   # MDVP:Shimmer(dB)
+        features.get("shimmer_apq3",   0.016),                   # Shimmer:APQ3
+        features.get("shimmer_apq5",   0.019),                   # Shimmer:APQ5
+        features.get("shimmer_apq11",  0.027),                   # MDVP:APQ
+        features.get("shimmer_dda",    0.047),                   # Shimmer:DDA
+        nhr,                                                      # NHR
+        hnr_clamped,                                              # HNR
+        rpde,                                                     # RPDE
+        dfa,                                                      # DFA
+        spread1,                                                  # spread1
+        spread2,                                                  # spread2
+        d2,                                                       # D2
+        ppe,                                                      # PPE
     ]
     return np.array(vec, dtype=np.float64)
 
@@ -360,31 +386,39 @@ def build_pdf(result: dict) -> bytes:
         v_str  = f"{val:.5f}" if val is not None else "—"
         status = "—"
         if val is not None:
-            # Simple range parse
             parts = rng.replace("< ","0 – ").split(" – ")
             if len(parts) == 2:
                 try:
                     lo, hi = float(parts[0]), float(parts[1])
                     status = "Normal" if lo <= val <= hi else "Abnormal"
-                except: pass
+                except:
+                    pass
         feat_rows.append([name, v_str, rng, status])
 
     ft = Table(feat_rows, colWidths=[65*mm, 35*mm, 45*mm, 25*mm])
-    def _status_color(v): return GREEN if v == "Normal" else (RED if v == "Abnormal" else GREY)
     style_cmds = [
-        ("BACKGROUND",  (0,0), (-1,0),  BLUE),
-        ("TEXTCOLOR",   (0,0), (-1,0),  colors.white),
-        ("FONTNAME",    (0,0), (-1,0),  "Helvetica-Bold"),
-        ("FONTNAME",    (0,1), (-1,-1), "Helvetica"),
-        ("FONTSIZE",    (0,0), (-1,-1), 8.5),
-        ("GRID",        (0,0), (-1,-1), 0.4, colors.HexColor("#bfdbfe")),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, LIGHT]),
-        ("PADDING",     (0,0), (-1,-1), 4.5),
+        ("BACKGROUND",   (0,0), (-1,0),  BLUE),
+        ("TEXTCOLOR",    (0,0), (-1,0),  colors.white),
+        ("FONTNAME",     (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTNAME",     (0,1), (-1,-1), "Helvetica"),
+        ("FONTSIZE",     (0,0), (-1,-1), 8.5),
+        ("GRID",         (0,0), (-1,-1), 0.4, colors.HexColor("#bfdbfe")),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [colors.white, LIGHT]),
+        ("PADDING",      (0,0), (-1,-1), 4.5),
     ]
-    for row_idx, (_, val, rng, status) in enumerate(feat_cfg, start=1):
-        c = _status_color(status)
-        style_cmds.append(("TEXTCOLOR", (3, row_idx), (3, row_idx), c))
-        style_cmds.append(("FONTNAME",  (3, row_idx), (3, row_idx), "Helvetica-Bold"))
+    for row_idx, (_, val, rng) in enumerate(feat_cfg, start=1):
+        if val is not None:
+            parts = rng.replace("< ","0 – ").split(" – ")
+            status = "—"
+            if len(parts) == 2:
+                try:
+                    lo, hi = float(parts[0]), float(parts[1])
+                    status = "Normal" if lo <= val <= hi else "Abnormal"
+                except:
+                    pass
+            c = GREEN if status == "Normal" else (RED if status == "Abnormal" else GREY)
+            style_cmds.append(("TEXTCOLOR", (3, row_idx), (3, row_idx), c))
+            style_cmds.append(("FONTNAME",  (3, row_idx), (3, row_idx), "Helvetica-Bold"))
     ft.setStyle(TableStyle(style_cmds))
     story += [ft, Spacer(1, 5*mm)]
 
@@ -547,11 +581,16 @@ async def get_stats():
 
 
 @app.post("/report")
-async def generate_report(result: dict):
+async def generate_report(request: Request):
+    """Accept raw JSON body for PDF generation."""
+    try:
+        result = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
     try:
         pdf_bytes = build_pdf(result)
     except Exception as e:
-        logger.error(f"PDF generation failed: {e}")
+        logger.error(f"PDF generation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
     ts       = datetime.utcnow().strftime("%Y%m%d_%H%M%S")

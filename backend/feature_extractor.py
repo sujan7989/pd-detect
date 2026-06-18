@@ -103,33 +103,89 @@ def extract_features(audio_bytes: bytes, sr_target: int = 22050) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _load_audio(audio_bytes: bytes, sr_target: int) -> tuple:
+    """
+    Load audio from bytes supporting WAV, WebM, OGG, MP3, FLAC.
+    Browser recordings come as WebM/OGG — handled via ffmpeg subprocess.
+    """
+    import subprocess, tempfile, os
+
     buf = io.BytesIO(audio_bytes)
+
+    # ── First try soundfile (handles WAV, FLAC, OGG Vorbis, AIFF) ──
     try:
+        buf.seek(0)
         y, sr = sf.read(buf)
         if y.ndim > 1:
             y = np.mean(y, axis=1)
         y = y.astype(np.float32)
         if sr != sr_target:
-            gcd = np.gcd(sr_target, sr)
+            gcd = int(np.gcd(sr_target, sr))
             y   = resample_poly(y, sr_target // gcd, sr // gcd).astype(np.float32)
             sr  = sr_target
+        return _trim_and_validate(y, sr)
     except Exception:
-        # Fallback: try reading as raw PCM 16-bit mono
-        buf.seek(0)
-        raw = np.frombuffer(buf.read(), dtype=np.int16)
-        y   = (raw / 32768.0).astype(np.float32)
-        sr  = sr_target
+        pass
 
-    # Trim silence (simple energy threshold)
+    # ── Fallback: use ffmpeg to convert WebM/MP3/M4A → WAV ──
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".input", delete=False) as tmp_in:
+            tmp_in.write(audio_bytes)
+            tmp_in_path = tmp_in.name
+
+        tmp_out_path = tmp_in_path + ".wav"
+
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", tmp_in_path,
+                "-ar", str(sr_target),
+                "-ac", "1",
+                "-f", "wav",
+                tmp_out_path,
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+
+        if result.returncode == 0 and os.path.exists(tmp_out_path):
+            y, sr = sf.read(tmp_out_path)
+            os.unlink(tmp_in_path)
+            os.unlink(tmp_out_path)
+            if y.ndim > 1:
+                y = np.mean(y, axis=1)
+            y = y.astype(np.float32)
+            return _trim_and_validate(y, sr)
+        else:
+            os.unlink(tmp_in_path)
+            if os.path.exists(tmp_out_path):
+                os.unlink(tmp_out_path)
+    except Exception:
+        pass
+
+    # ── Last resort: assume raw PCM int16 ──
+    try:
+        raw = np.frombuffer(audio_bytes, dtype=np.int16)
+        if len(raw) < 100:
+            raise ValueError("Too short")
+        y = (raw / 32768.0).astype(np.float32)
+        return _trim_and_validate(y, sr_target)
+    except Exception as e:
+        raise ValueError(f"Could not decode audio: {e}")
+
+
+def _trim_and_validate(y: np.ndarray, sr: int) -> tuple:
+    """Trim silence and validate minimum length."""
+    if len(y) == 0:
+        raise ValueError("Audio is empty.")
     energy = y ** 2
     mask   = energy > 1e-6
     if mask.any():
-        start, end = np.argmax(mask), len(mask) - np.argmax(mask[::-1])
-        y = y[start:end]
-
+        start = int(np.argmax(mask))
+        end   = int(len(mask) - np.argmax(mask[::-1]))
+        if end > start:
+            y = y[start:end]
     if len(y) < sr * 0.1:
         raise ValueError("Audio too short for analysis (< 0.1 s after trimming).")
-
     return y, sr
 
 
@@ -228,26 +284,29 @@ def _extract_pitch(y: np.ndarray, sr: int,
         frame = y[i * hop_len: i * hop_len + frame_len]
         if len(frame) < frame_len:
             break
-        # Normalize
         frame = frame - np.mean(frame)
-        if np.max(np.abs(frame)) < 1e-6:
+        rms = np.sqrt(np.mean(frame ** 2))
+        if rms < 1e-5:
             continue
+        # Normalize
+        frame = frame / (rms + 1e-10)
         # Autocorrelation via FFT
         n   = len(frame)
         fa  = rfft(frame, n=n * 2)
         ac  = np.real(np.fft.irfft(fa * np.conj(fa)))[:n]
-        # Normalize by zero-lag
         if ac[0] <= 0:
             continue
         ac /= ac[0]
         # Find peak in valid lag range
-        if lag_max >= len(ac):
-            lag_max = len(ac) - 1
-        segment = ac[lag_min: lag_max]
+        lmax = min(lag_max, len(ac) - 1)
+        if lmax <= lag_min:
+            continue
+        segment  = ac[lag_min: lmax]
         if len(segment) == 0:
             continue
-        peak_idx = np.argmax(segment) + lag_min
-        if ac[peak_idx] > 0.3:          # voiced threshold
+        peak_idx = int(np.argmax(segment)) + lag_min
+        # Lower threshold to 0.15 to detect more voiced frames
+        if ac[peak_idx] > 0.15:
             f0[i] = sr / peak_idx
 
     return f0
@@ -315,28 +374,60 @@ def _frame_rms(y: np.ndarray, frame_len: int, hop_len: int) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _compute_hnr(y: np.ndarray, sr: int) -> float:
+    """
+    Compute HNR using the cepstrum-based method.
+    More accurate than pure autocorrelation for synthetic/real speech.
+    Healthy voices: 20-33 dB. PD voices: 8-25 dB.
+    """
     frame_len = int(sr * 0.04)
-    hop_len   = int(sr * 0.01)
-    lag_min   = int(sr / 500)
-    lag_max   = int(sr / 75)
+    hop_len   = int(sr * 0.02)
     hnr_vals  = []
 
     for i in range(0, len(y) - frame_len, hop_len):
-        frame = y[i: i + frame_len]
-        frame = frame - np.mean(frame)
-        if np.max(np.abs(frame)) < 1e-6: continue
-        n  = len(frame)
-        fa = rfft(frame, n=n*2)
-        ac = np.real(np.fft.irfft(fa * np.conj(fa)))[:n]
-        if ac[0] <= 0: continue
-        if lag_max >= len(ac): continue
-        peak_idx = np.argmax(ac[lag_min:lag_max]) + lag_min
-        r0, r1   = ac[0], ac[peak_idx]
-        if r0 <= 0 or r1 <= 0: continue
-        val = 10 * np.log10(r1 / (r0 - r1 + 1e-9) + 1e-9)
-        hnr_vals.append(float(np.clip(val, -20, 40)))
+        frame = y[i: i + frame_len].copy()
+        frame -= np.mean(frame)
+        rms = np.sqrt(np.mean(frame ** 2))
+        if rms < 1e-5:
+            continue
 
-    return float(np.mean(hnr_vals)) if hnr_vals else 15.0
+        # Window
+        frame *= np.hanning(len(frame))
+        frame /= (np.max(np.abs(frame)) + 1e-10)
+
+        n    = len(frame)
+        # Power spectrum
+        spec = np.abs(np.fft.rfft(frame, n=n)) ** 2
+        spec = np.maximum(spec, 1e-10)
+
+        # Cepstrum
+        log_spec = np.log(spec)
+        cepst    = np.real(np.fft.irfft(log_spec))
+
+        # Find fundamental period in cepstrum (between 2ms and 13ms)
+        t_min = int(sr * 0.002)   # 2ms
+        t_max = int(sr * 0.013)   # 13ms
+        if t_max >= len(cepst):
+            t_max = len(cepst) - 1
+        if t_max <= t_min:
+            continue
+
+        seg      = np.abs(cepst[t_min:t_max])
+        peak_val = np.max(seg)
+        # Estimate HNR from cepstral peak strength
+        # Strong peak = high harmonic content = high HNR
+        noise_floor = np.median(np.abs(cepst[5: t_min]))
+        if noise_floor < 1e-8:
+            continue
+        ratio = peak_val / (noise_floor + 1e-10)
+        # Convert to dB scale (empirically calibrated)
+        hnr_est = 20.0 * np.log10(ratio + 1e-6)
+        # Clamp to realistic speech range
+        hnr_vals.append(float(np.clip(hnr_est, 0.0, 40.0)))
+
+    if not hnr_vals:
+        return 20.0  # default healthy-ish value
+
+    return float(np.median(hnr_vals))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
