@@ -1,60 +1,51 @@
-# 🧠 PD Detect — Parkinson's Disease Voice Analysis Platform
+# 🧠 PD Detect — Parkinson's Disease Voice Analysis
 
-> **Research & Educational Use Only.** Not a medical diagnosis tool.
-> Always consult a qualified neurologist for medical evaluation.
+> Research & Educational Use Only. Not a medical diagnosis.
 
-A production-grade, full-stack web application for Parkinson's Disease screening
-through acoustic voice biomarker analysis. Uses a trained ensemble ML model (Random Forest
-+ XGBoost + SVM) on the UCI Parkinson's Dataset with a premium dark-mode UI.
+A full-stack AI-powered web application for Parkinson's Disease screening through voice biomarker analysis.
 
----
+## 🚀 Live Demo
+- **Frontend:** https://pd-detect.vercel.app
+- **API:** https://pd-detect-api.onrender.com
+- **API Docs:** https://pd-detect-api.onrender.com/docs
 
-## ✨ Live Demo
+## ✨ Features
+- 🎙️ Live voice recording in browser (no app install needed)
+- 📂 Upload WAV/MP3/OGG/WebM/FLAC audio files
+- 🤖 68+ acoustic features: MFCCs, jitter, shimmer, HNR, pitch, ZCR
+- 🧠 3-model ensemble: Random Forest + XGBoost + Calibrated SVM
+- 📊 Interactive charts: radar, bar, feature importance
+- 📋 Analysis history (saved in browser, persists across sessions)
+- 📄 PDF report download
+- 📱 Mobile responsive dark UI
 
-| Service  | URL                         |
-|----------|-----------------------------|
-| Frontend | http://localhost:5173       |
-| Backend  | http://localhost:8000       |
-| API Docs | http://localhost:8000/docs  |
+## 🛠️ Tech Stack
+**Backend:** Python, FastAPI, scikit-learn, XGBoost, numpy, scipy, soundfile, ReportLab  
+**Frontend:** React 18, Vite, Tailwind CSS, Recharts, Axios  
+**Deployed:** Vercel (frontend) + Render (backend)
 
----
+## 📊 ML Model
+Trained on UCI Parkinson's Dataset (195 samples, 22 features)
+- Random Forest: ~94.9% accuracy
+- XGBoost: ~94.9% accuracy
+- SVM (Calibrated): ~87.2% accuracy
+- **Ensemble: ~92.3% accuracy**
 
-## 🚀 Quick Start (One-Click)
-
-Double-click these `.bat` files in the project root:
-
-1. **`START_BACKEND.bat`** — Installs dependencies & starts FastAPI server
-2. **`START_FRONTEND.bat`** — Installs dependencies & starts React dev server
-3. **`TRAIN_MODEL.bat`** — Downloads UCI dataset & trains the ML ensemble (run once)
-
-Then open **http://localhost:5173** in your browser.
-
----
-
-## 📋 Manual Setup
+## 🖥️ Local Development
 
 ### Prerequisites
 - Python 3.10+
 - Node.js 18+
-- Internet connection (first run only, for dataset download)
 
 ### Backend
 ```bash
 cd backend
 python -m venv venv
-
-# Windows
-venv\Scripts\activate
-# macOS/Linux
-source venv/bin/activate
-
+venv\Scripts\activate        # Windows
+source venv/bin/activate     # Mac/Linux
 pip install -r requirements.txt
-
-# Train the ML model (required once — downloads UCI dataset ~3KB, takes ~2 min)
-python model_trainer.py
-
-# Start the API
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+python model_trainer.py      # Train models (once)
+uvicorn main:app --reload --port 8000
 ```
 
 ### Frontend
@@ -62,122 +53,29 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 cd frontend
 npm install
 npm run dev
+# Open http://localhost:5173
 ```
 
----
-
-## 🏗 Project Structure
-
+## 📁 Project Structure
 ```
 parkinsons-detection/
 ├── backend/
-│   ├── main.py                  # FastAPI application
-│   ├── model_trainer.py         # ML training script
-│   ├── feature_extractor.py     # Audio → 60+ acoustic features
+│   ├── main.py              # FastAPI app
+│   ├── feature_extractor.py # Audio → 68 features (pure numpy/scipy)
+│   ├── model_trainer.py     # Train RF+XGBoost+SVM on UCI dataset
 │   ├── requirements.txt
-│   └── models/                  # Saved models (after training)
-│       ├── ensemble.pkl
-│       ├── scaler.pkl
-│       ├── random_forest.pkl
-│       ├── xgboost.pkl
-│       ├── svm.pkl
-│       └── feature_importance.json
-└── frontend/
-    ├── package.json
-    ├── vite.config.js
-    ├── tailwind.config.js
-    ├── index.html
-    └── src/
-        ├── main.jsx
-        ├── App.jsx
-        ├── index.css
-        ├── api/
-        │   └── client.js          # Axios API client
-        ├── pages/
-        │   ├── AnalyzePage.jsx    # Main analysis page
-        │   ├── DashboardPage.jsx  # Analytics dashboard
-        │   ├── HistoryPage.jsx    # Analysis history
-        │   └── AboutPage.jsx      # Documentation
-        └── components/
-            ├── AudioRecorder.jsx  # Record/upload + analyze
-            ├── WaveformVisualizer.jsx  # Live canvas waveform
-            ├── ResultPanel.jsx    # Full results display
-            ├── ConfidenceRing.jsx # Animated SVG confidence gauge
-            ├── AcousticCharts.jsx # Radar + bar + importance charts
-            └── ParticleField.jsx  # Background particle animation
+│   ├── Dockerfile
+│   └── models/              # Trained model files (.pkl)
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx
+│   │   ├── api/client.js    # API + localStorage
+│   │   ├── pages/           # Analyze, Dashboard, History, About
+│   │   └── components/      # AudioRecorder, ResultPanel, Charts...
+│   └── vercel.json
+├── render.yaml
+└── README.md
 ```
-
----
-
-## 🤖 ML Model
-
-| Model          | Accuracy | Notes                        |
-|----------------|----------|------------------------------|
-| Random Forest  | ~94.9%   | 200 trees                    |
-| XGBoost        | ~94.9%   | 200 estimators, lr=0.05      |
-| SVM (Calib.)   | ~87.2%   | RBF kernel, C=10             |
-| **Ensemble**   | **~92.3%** | Soft-voting, 5-fold CV    |
-
-Trained on UCI Parkinson's Dataset (195 samples, 22 features).
-*Little MA et al. (2007). Exploiting Nonlinear Recurrence and Fractal Scaling Properties for Voice Disorder Detection.*
-
----
-
-## 🔌 API Reference
-
-| Method | Endpoint        | Description                     |
-|--------|-----------------|---------------------------------|
-| GET    | `/health`       | Health check + model status     |
-| POST   | `/analyze`      | Analyze audio file              |
-| GET    | `/history`      | Get all past analyses           |
-| DELETE | `/history`      | Clear all history               |
-| DELETE | `/history/{id}` | Delete single record            |
-| GET    | `/stats`        | Aggregate dashboard statistics  |
-| POST   | `/report`       | Generate PDF report             |
-
-### POST /analyze — Example Response
-```json
-{
-  "id": "A1B2C3D4",
-  "timestamp": "2025-01-15 10:30:00 UTC",
-  "prediction": "Parkinson's Detected",
-  "confidence": 87.3,
-  "probability": 0.873,
-  "risk_level": "High",
-  "features": {
-    "jitter_local": 0.00892,
-    "shimmer_local": 0.07321,
-    "hnr": 12.45,
-    "pitch_mean": 142.3,
-    "mfcc_1_mean": -245.3
-  },
-  "feature_importance": {
-    "PPE": { "importance": 0.168, "value": 0.234, "normal_min": null, "normal_max": null }
-  },
-  "recommendations": ["Consult a neurologist..."],
-  "model_used": "Ensemble (RF + XGBoost + SVM)"
-}
-```
-
----
-
-## 🎨 Tech Stack
-
-**Backend:** FastAPI · librosa · scikit-learn · XGBoost · ReportLab · soundfile · numpy · pandas
-
-**Frontend:** React 18 · Vite 5 · Tailwind CSS v3 · Recharts · react-router-dom ·
-react-dropzone · react-hot-toast · lucide-react · axios
-
-**ML:** Random Forest · XGBoost · Calibrated SVM · VotingClassifier · StandardScaler
-
----
 
 ## ⚠️ Disclaimer
-
-This software is for **research and educational purposes only**. It:
-- Does **not** provide medical diagnoses
-- Is **not** FDA approved or clinically validated
-- Should **not** replace professional medical advice
-- Is based on a dataset of only 195 samples
-
-**Always consult a board-certified neurologist for Parkinson's Disease evaluation.**
+For research and educational purposes only. Not FDA approved. Not a medical diagnosis.

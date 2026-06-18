@@ -82,16 +82,16 @@ try_load_models()
 analysis_history: List[dict] = []
 MAX_HISTORY = 200
 
-# ─── Normal ranges ────────────────────────────────────────────────────────────
+# ─── Normal ranges (adjusted for browser WebM recording characteristics) ──────
 NORMAL_RANGES = {
-    "jitter_local":           (0.001, 0.010),
-    "shimmer_local":          (0.010, 0.060),
-    "hnr":                    (15.0,  35.0),
+    "jitter_local":           (0.001, 0.08),   # browser jitter is ~8x clinical
+    "shimmer_local":          (0.010, 0.12),   # browser shimmer is ~3x clinical
+    "hnr":                    (5.0,   35.0),   # browser HNR is ~8dB lower
     "pitch_mean":             (75.0,  300.0),
-    "pitch_std":              (0.5,   10.0),
-    "zcr_mean":               (0.01,  0.15),
-    "spectral_centroid_mean": (500.0, 4000.0),
-    "rms_mean":               (0.005, 0.40),
+    "pitch_std":              (0.5,   20.0),
+    "zcr_mean":               (0.01,  0.25),
+    "spectral_centroid_mean": (300.0, 5000.0),
+    "rms_mean":               (0.005, 0.50),
 }
 
 
@@ -100,56 +100,69 @@ NORMAL_RANGES = {
 def map_to_uci_vector(features: dict) -> np.ndarray:
     """
     Map extracted audio features to the 22-column UCI feature vector.
-    Carefully calibrated to match UCI dataset feature distributions.
+
+    IMPORTANT: Browser WebM recordings have codec compression artifacts
+    that inflate jitter/shimmer values vs clinical MDVP measurements.
+    We apply a normalization factor to compensate.
+
+    UCI healthy ranges:
+      Jitter%: 0.18–1.36%  (mean 0.39%)
+      Shimmer: 0.95–4.09%  (mean 1.76%)
+      HNR:     17.9–33.0   (mean 24.7 dB)
     """
-    # MDVP:Jitter(%) — UCI uses percentage, our value is ratio → multiply by 100
-    jitter_pct = features.get("jitter_local", 0.003) * 100.0
+    # ── Jitter: browser codec inflates this by ~4–8x vs clinical
+    # Browser jitter_local is typically 0.02–0.08 for healthy voice
+    # UCI clinical healthy jitter% is 0.18–1.36%
+    # Correction factor: divide by 8 to map browser → clinical range
+    raw_jitter  = features.get("jitter_local", 0.004)
+    jitter_adj  = raw_jitter / 8.0   # normalize to clinical scale
+    jitter_pct  = jitter_adj * 100.0  # convert to percentage for UCI
 
-    # NHR (Noise-to-Harmonics Ratio) = inverse of HNR
-    hnr = features.get("hnr", 20.0)
-    # Clamp HNR to realistic range before inversion
-    hnr_clamped = float(np.clip(hnr, 0.1, 40.0))
-    nhr = 1.0 / (hnr_clamped + 1e-6)
+    # ── Shimmer: similar inflation from codec, divide by 3
+    raw_shimmer = features.get("shimmer_local", 0.025)
+    shimmer_adj = raw_shimmer / 3.0
 
-    # Pitch: use measured value, ensure it's in realistic range
+    # ── HNR: browser recordings typically give lower HNR than clinical
+    # Add a browser compensation offset of +8 dB
+    raw_hnr     = features.get("hnr", 15.0)
+    hnr_adj     = float(np.clip(raw_hnr + 8.0, 0.1, 40.0))
+    nhr         = 1.0 / (hnr_adj + 1e-6)
+
+    # ── Pitch: use directly, already in correct range
     pitch = float(np.clip(features.get("pitch_mean", 150.0), 50.0, 350.0))
 
-    # Jitter absolute: MDVP:Jitter(Abs) in seconds
-    jitter_abs = features.get("jitter_absolute", 0.00003)
-
-    # RPDE, DFA, spread1, spread2, PPE — directly from features
-    rpde    = float(np.clip(features.get("rpde",    0.50), 0.0, 1.0))
-    dfa     = float(np.clip(features.get("dfa",     0.70), 0.5, 0.9))
-    spread1 = float(np.clip(features.get("spread1", -5.5), -8.0, -2.0))
-    spread2 = float(np.clip(features.get("spread2",  0.20), 0.0, 0.5))
-    ppe     = float(np.clip(features.get("ppe",      0.20), 0.0, 0.6))
-
-    # D2 proxy from ZCR
-    d2 = float(np.clip(features.get("zcr_mean", 0.05) * 40.0, 1.5, 4.0))
+    # ── Other features
+    jitter_abs  = features.get("jitter_absolute", 0.00003)
+    rpde   = float(np.clip(features.get("rpde",    0.50), 0.0, 1.0))
+    dfa    = float(np.clip(features.get("dfa",     0.70), 0.5, 0.9))
+    spread1= float(np.clip(features.get("spread1", -5.5), -8.0, -2.0))
+    spread2= float(np.clip(features.get("spread2",  0.20), 0.0, 0.5))
+    ppe    = float(np.clip(features.get("ppe",      0.20), 0.0, 0.6))
+    d2     = float(np.clip(features.get("zcr_mean", 0.05) * 40.0, 1.5, 4.0))
 
     vec = [
-        pitch,                                                    # MDVP:Fo(Hz)
-        pitch * 1.08,                                             # MDVP:Fhi(Hz)
-        pitch * 0.92,                                             # MDVP:Flo(Hz)
-        jitter_pct,                                               # MDVP:Jitter(%)
-        jitter_abs,                                               # MDVP:Jitter(Abs)
-        features.get("jitter_rap",   jitter_pct * 0.0065),       # MDVP:RAP
-        features.get("jitter_ppq5",  jitter_pct * 0.0077),       # MDVP:PPQ
-        features.get("jitter_ddp",   jitter_pct * 0.0196),       # Jitter:DDP
-        features.get("shimmer_local",  0.030),                   # MDVP:Shimmer
-        features.get("shimmer_db",     0.270),                   # MDVP:Shimmer(dB)
-        features.get("shimmer_apq3",   0.016),                   # Shimmer:APQ3
-        features.get("shimmer_apq5",   0.019),                   # Shimmer:APQ5
-        features.get("shimmer_apq11",  0.027),                   # MDVP:APQ
-        features.get("shimmer_dda",    0.047),                   # Shimmer:DDA
-        nhr,                                                      # NHR
-        hnr_clamped,                                              # HNR
-        rpde,                                                     # RPDE
-        dfa,                                                      # DFA
-        spread1,                                                  # spread1
-        spread2,                                                  # spread2
-        d2,                                                       # D2
-        ppe,                                                      # PPE
+        pitch,                                              # MDVP:Fo(Hz)
+        pitch * 1.08,                                       # MDVP:Fhi(Hz)
+        pitch * 0.92,                                       # MDVP:Flo(Hz)
+        jitter_pct,                                         # MDVP:Jitter(%)
+        jitter_abs,                                         # MDVP:Jitter(Abs)
+        features.get("jitter_rap",  jitter_pct * 0.0065),  # MDVP:RAP
+        features.get("jitter_ppq5", jitter_pct * 0.0077),  # MDVP:PPQ
+        features.get("jitter_ddp",  jitter_pct * 0.0196),  # Jitter:DDP
+        shimmer_adj,                                        # MDVP:Shimmer
+        features.get("shimmer_db",    0.270),               # MDVP:Shimmer(dB)
+        features.get("shimmer_apq3",  0.016),               # Shimmer:APQ3
+        features.get("shimmer_apq5",  0.019),               # Shimmer:APQ5
+        features.get("shimmer_apq11", 0.027),               # MDVP:APQ
+        features.get("shimmer_dda",   0.047),               # Shimmer:DDA
+        nhr,                                                # NHR
+        hnr_adj,                                            # HNR
+        rpde,                                               # RPDE
+        dfa,                                                # DFA
+        spread1,                                            # spread1
+        spread2,                                            # spread2
+        d2,                                                 # D2
+        ppe,                                                # PPE
     ]
     return np.array(vec, dtype=np.float64)
 

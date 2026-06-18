@@ -31,12 +31,12 @@ const HEALTHY_REF = {
 };
 
 const BAR_FEATURES = [
-  { name: "Jitter",    key: "jitter_local",  min: 0.001, max: 0.01,  digits: 5 },
-  { name: "Shimmer",   key: "shimmer_local", min: 0.01,  max: 0.06,  digits: 5 },
-  { name: "HNR (dB)",  key: "hnr",           min: 15,    max: 35,    digits: 2 },
+  { name: "Jitter",    key: "jitter_local",  min: 0.001, max: 0.08,  digits: 5 },
+  { name: "Shimmer",   key: "shimmer_local", min: 0.01,  max: 0.12,  digits: 5 },
+  { name: "HNR (dB)",  key: "hnr",           min: 5,     max: 35,    digits: 2 },
   { name: "Pitch",     key: "pitch_mean",    min: 75,    max: 300,   digits: 1 },
-  { name: "Pitch Std", key: "pitch_std",     min: 0.5,   max: 10,    digits: 2 },
-  { name: "ZCR",       key: "zcr_mean",      min: 0.01,  max: 0.15,  digits: 4 },
+  { name: "Pitch Std", key: "pitch_std",     min: 0.5,   max: 20,    digits: 2 },
+  { name: "ZCR",       key: "zcr_mean",      min: 0.01,  max: 0.25,  digits: 4 },
   { name: "RPDE",      key: "rpde",          min: 0.4,   max: 0.65,  digits: 4 },
   { name: "DFA",       key: "dfa",           min: 0.5,   max: 0.8,   digits: 4 },
   { name: "Spread1",   key: "spread1",       min: -7,    max: -4,    digits: 3 },

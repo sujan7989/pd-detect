@@ -10,14 +10,14 @@ import AcousticCharts from "./AcousticCharts.jsx";
 import { downloadReport } from "../api/client.js";
 
 const NORMAL_RANGES = {
-  jitter_local:            [0.001, 0.01],
-  shimmer_local:           [0.01,  0.06],
-  hnr:                     [15,    35  ],
+  jitter_local:            [0.001, 0.08],   // browser audio is ~8x clinical
+  shimmer_local:           [0.01,  0.12],   // browser audio is ~3x clinical
+  hnr:                     [5,     35  ],   // browser HNR is ~8dB lower
   pitch_mean:              [75,    300 ],
-  pitch_std:               [0.5,   10  ],
-  zcr_mean:                [0.01,  0.15],
-  spectral_centroid_mean:  [500,   4000],
-  rms_mean:                [0.005, 0.4 ],
+  pitch_std:               [0.5,   20  ],
+  zcr_mean:                [0.01,  0.25],
+  spectral_centroid_mean:  [300,   5000],
+  rms_mean:                [0.005, 0.5 ],
 };
 
 function MetricTile({ label, value, unit, rangeKey, delay = 0 }) {

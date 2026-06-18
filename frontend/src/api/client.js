@@ -1,11 +1,7 @@
 ﻿import axios from "axios";
 
-// Backend URLs - tries HuggingFace first, falls back to Render, then localhost
-const PRODUCTION_URL = "https://pd-detect-api.onrender.com";
-const FALLBACK_URL   = "https://pd-detect-api.onrender.com";
-
 const BASE = import.meta.env.VITE_API_URL ||
-  (import.meta.env.PROD ? PRODUCTION_URL : "http://localhost:8000");
+  (import.meta.env.PROD ? "https://pd-detect-api.onrender.com" : "http://localhost:8000");
 
 const api = axios.create({ baseURL: BASE, timeout: 120000 });
 
@@ -17,17 +13,50 @@ api.interceptors.response.use(
       err.code === "ECONNREFUSED" ||
       err.message?.toLowerCase().includes("network");
     err.userMessage = isNet
-      ? "Server is waking up â€” please wait 30 seconds and try again."
+      ? "Server is waking up — please wait 30 seconds and try again."
       : err.response?.data?.detail || err.message || "An unexpected error occurred.";
     return Promise.reject(err);
   }
 );
 
-export const checkHealth        = ()        => api.get("/health").then((r) => r.data);
-export const getHistory         = ()        => api.get("/history").then((r) => r.data);
-export const clearHistory       = ()        => api.delete("/history").then((r) => r.data);
-export const deleteHistoryEntry = (id)      => api.delete(`/history/${id}`).then((r) => r.data);
-export const getStats           = ()        => api.get("/stats").then((r) => r.data);
+// ── localStorage persistence ──────────────────────────────────────────────
+const HISTORY_KEY = "pd_detect_history_v2";
+
+export const saveToLocalHistory = (result) => {
+  try {
+    const existing = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+    const updated = [result, ...existing].slice(0, 100);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(updated));
+  } catch {}
+};
+
+export const getLocalHistory = () => {
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+  } catch {
+    return [];
+  }
+};
+
+export const clearLocalHistory = () => {
+  try {
+    localStorage.removeItem(HISTORY_KEY);
+  } catch {}
+};
+
+export const deleteLocalEntry = (id) => {
+  try {
+    const existing = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+    localStorage.setItem(
+      HISTORY_KEY,
+      JSON.stringify(existing.filter((h) => h.id !== id))
+    );
+  } catch {}
+};
+
+// ── API calls ─────────────────────────────────────────────────────────────
+export const checkHealth = () => api.get("/health").then((r) => r.data);
+export const getStats    = () => api.get("/stats").then((r) => r.data);
 
 export const analyzeAudio = (blob, filename, onProgress) => {
   const form = new FormData();
@@ -36,10 +65,14 @@ export const analyzeAudio = (blob, filename, onProgress) => {
     .post("/analyze", form, {
       headers: { "Content-Type": "multipart/form-data" },
       onUploadProgress: (e) => {
-        if (onProgress && e.total) onProgress(Math.round((e.loaded / e.total) * 100));
+        if (onProgress && e.total)
+          onProgress(Math.round((e.loaded / e.total) * 100));
       },
     })
-    .then((r) => r.data);
+    .then((r) => {
+      saveToLocalHistory(r.data); // persist immediately to localStorage
+      return r.data;
+    });
 };
 
 export const downloadReport = async (result) => {
@@ -57,4 +90,3 @@ export const downloadReport = async (result) => {
 };
 
 export default api;
-
