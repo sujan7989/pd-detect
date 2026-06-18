@@ -1,7 +1,7 @@
-import axios from "axios";
+﻿import axios from "axios";
 
 // Backend URLs - tries HuggingFace first, falls back to Render, then localhost
-const PRODUCTION_URL = "https://sujan7989-pd-detect-api.hf.space";
+const PRODUCTION_URL = "https://pd-detect-api.onrender.com";
 const FALLBACK_URL   = "https://pd-detect-api.onrender.com";
 
 const BASE = import.meta.env.VITE_API_URL ||
@@ -17,7 +17,7 @@ api.interceptors.response.use(
       err.code === "ECONNREFUSED" ||
       err.message?.toLowerCase().includes("network");
     err.userMessage = isNet
-      ? "Server is waking up — please wait 30 seconds and try again."
+      ? "Server is waking up â€” please wait 30 seconds and try again."
       : err.response?.data?.detail || err.message || "An unexpected error occurred.";
     return Promise.reject(err);
   }
@@ -57,3 +57,4 @@ export const downloadReport = async (result) => {
 };
 
 export default api;
+
