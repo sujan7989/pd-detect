@@ -1,8 +1,12 @@
 import axios from "axios";
 
-// In production (Vercel), set VITE_API_URL to your Render backend URL
-// e.g. https://pd-detect-api.onrender.com
-const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
+// Production: uses Render backend
+// Development: uses local backend
+const BASE =
+  import.meta.env.VITE_API_URL ||
+  (import.meta.env.PROD
+    ? "https://pd-detect-api.onrender.com"
+    : "http://localhost:8000");
 
 const api = axios.create({ baseURL: BASE, timeout: 90000 });
 
