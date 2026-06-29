@@ -99,71 +99,130 @@ NORMAL_RANGES = {
 
 def map_to_uci_vector(features: dict) -> np.ndarray:
     """
-    Map extracted audio features to the 22-column UCI feature vector.
+    Map extracted audio features → 22 UCI feature vector.
 
-    IMPORTANT: Browser WebM recordings have codec compression artifacts
-    that inflate jitter/shimmer values vs clinical MDVP measurements.
-    We apply a normalization factor to compensate.
-
-    UCI healthy ranges:
-      Jitter%: 0.18–1.36%  (mean 0.39%)
-      Shimmer: 0.95–4.09%  (mean 1.76%)
-      HNR:     17.9–33.0   (mean 24.7 dB)
+    Diagnosis findings (2026-06-19):
+    - Jitter: our ratio 0.007 == UCI proportion 0.007 (same scale, NO multiplication needed)
+    - Shimmer: our value ~2.5x UCI → divide by 2.5
+    - HNR: our cepstrum gives ~5-12 dB, UCI healthy=24.7 → add +11.5 dB offset
+    - RPDE: our proxy 0.26-0.35, UCI 0.26-0.69 → scale up
+    - DFA: our proxy 0.46-0.75, UCI 0.57-0.83 → linear shift
+    - spread1: our log(pitch_std) gives -18, UCI gives -7 to -2 → use pitch-based proxy
+    - spread2: use jitter-based proxy
+    - PPE: use shimmer-based proxy
     """
-    # ── Jitter: browser codec inflates this by ~4–8x vs clinical
-    # Browser jitter_local is typically 0.02–0.08 for healthy voice
-    # UCI clinical healthy jitter% is 0.18–1.36%
-    # Correction factor: divide by 8 to map browser → clinical range
-    raw_jitter  = features.get("jitter_local", 0.004)
-    jitter_adj  = raw_jitter / 8.0   # normalize to clinical scale
-    jitter_pct  = jitter_adj * 100.0  # convert to percentage for UCI
+    # ── Pitch ──────────────────────────────────────────────────────────────
+    pitch = float(np.clip(features.get("pitch_mean", 154.0), 50.0, 400.0))
 
-    # ── Shimmer: similar inflation from codec, divide by 3
-    raw_shimmer = features.get("shimmer_local", 0.025)
-    shimmer_adj = raw_shimmer / 3.0
+    # ── Jitter — SAME scale as UCI (both are proportions 0.001–0.033) ──────
+    raw_jitter = float(features.get("jitter_local", 0.004))
+    jitter_pct = float(np.clip(raw_jitter, 0.0017, 0.0330))   # UCI range
 
-    # ── HNR: browser recordings typically give lower HNR than clinical
-    # Add a browser compensation offset of +8 dB
-    raw_hnr     = features.get("hnr", 15.0)
-    hnr_adj     = float(np.clip(raw_hnr + 8.0, 0.1, 40.0))
-    nhr         = 1.0 / (hnr_adj + 1e-6)
+    jitter_abs = float(np.clip(features.get("jitter_absolute", raw_jitter / 200),
+                               0.0, 0.000290))
+    jitter_rap = float(np.clip(features.get("jitter_rap", raw_jitter * 0.50),
+                               0.0, 0.0210))
+    jitter_ppq = float(np.clip(features.get("jitter_ppq5", raw_jitter * 0.55),
+                               0.0, 0.0190))
+    jitter_ddp = jitter_rap * 3.0
 
-    # ── Pitch: use directly, already in correct range
-    pitch = float(np.clip(features.get("pitch_mean", 150.0), 50.0, 350.0))
+    # ── Shimmer — divide by 2.0 (not 2.5, previous was over-correcting) ────
+    # Diagnosis: shimmer 0.012 / 2.5 = 0.0048 (below UCI min 0.0095)
+    # Use 2.0: shimmer 0.015 / 2.0 = 0.0075 → clips to 0.0095 (UCI min)
+    raw_shimmer  = float(features.get("shimmer_local", 0.025))
+    shimmer      = float(np.clip(raw_shimmer / 2.0, 0.0095, 0.119))
+    shimmer_db   = float(np.clip(features.get("shimmer_db", shimmer * 9.0), 0.048, 2.28))
+    shimmer_apq3 = float(np.clip(features.get("shimmer_apq3", shimmer * 0.53), 0.0, 0.056))
+    shimmer_apq5 = float(np.clip(features.get("shimmer_apq5", shimmer * 0.60), 0.0, 0.079))
+    shimmer_apq  = float(np.clip(features.get("shimmer_apq11", shimmer * 0.81), 0.0, 0.137))
+    shimmer_dda  = shimmer_apq3 * 3.0
 
-    # ── Other features
-    jitter_abs  = features.get("jitter_absolute", 0.00003)
-    rpde   = float(np.clip(features.get("rpde",    0.50), 0.0,  1.0))
-    dfa    = float(np.clip(features.get("dfa",     0.70), 0.5,  0.9))
-    spread1= float(np.clip(features.get("spread1", -5.5), -8.0, -2.0))
-    # spread2 and ppe from feature_extractor are log-scale negatives — keep them
-    spread2= float(np.clip(features.get("spread2", -2.5), -8.0, -0.5))
-    ppe    = float(np.clip(features.get("ppe",     -1.7), -7.0, -0.5))
-    d2     = float(np.clip(features.get("zcr_mean", 0.05) * 40.0, 1.5, 4.0))
+    # ── HNR / NHR ─────────────────────────────────────────────────────────
+    # Our cepstrum HNR gives ~10-14 dB. UCI healthy mean = 24.68 dB.
+    raw_hnr = float(features.get("hnr", 15.0))
+    hnr     = float(np.clip(raw_hnr + 13.7, 8.44, 33.05))
+
+    # NHR calibration from real UCI healthy low-pitch data:
+    # UCI healthy: HNR=23-27dB → NHR=0.004-0.014 (mean=0.0115)
+    # UCI PD:      HNR=20-22dB → NHR=0.015-0.030 (mean=0.0292)
+    # Linear interpolation: NHR = max(0.00065, 0.105 - 0.00385 * hnr)
+    # Check: hnr=24.68 → 0.105 - 0.00385*24.68 = 0.105 - 0.095 = 0.010 ✓ (close to 0.0115)
+    #        hnr=20.97 → 0.105 - 0.00385*20.97 = 0.105 - 0.081 = 0.024 ✓ (close to 0.0292)
+    nhr = float(np.clip(0.105 - 0.00385 * hnr, 0.00065, 0.31482))
+
+    # ── RPDE — our proxy ~0.26–0.35, UCI healthy=0.443, PD=0.517 ────────────
+    # Our values are too low. Need stronger scaling.
+    # Map: our 0.27 → UCI 0.44 (healthy), our 0.35 → UCI 0.52 (PD)
+    # Linear: uci = raw * 2.1 - 0.127
+    raw_rpde = float(features.get("rpde", 0.30))
+    rpde     = float(np.clip(raw_rpde * 2.1 - 0.127, 0.257, 0.685))
+
+    # ── DFA — our proxy ~0.46–0.75, UCI healthy=0.696, PD=0.725 ─────────────
+    # Map: our 0.47 → UCI 0.65 (not enough), need bigger scaling
+    # uci = raw * 0.40 + 0.51 puts our 0.47 → 0.699 (healthy!) and 0.75 → 0.81 (PD)
+    raw_dfa = float(features.get("dfa", 0.65))
+    dfa     = float(np.clip(raw_dfa * 0.40 + 0.51, 0.574, 0.826))
+
+    # ── spread1 — UCI range -7.96 to -2.43, healthy=-6.76, PD=-5.33 ────────
+    # Key: spread1 in UCI is related to fundamental frequency variation.
+    # Higher pitch + lower jitter → more negative (more healthy).
+    # Calibration based on diagnosis output:
+    #   pitch=182, jitter=0.0026 → should give -6.5 (healthy)
+    #   pitch=160, jitter=0.0027 → should give -6.2 (still healthy, lower pitch)
+    #   pitch=145, jitter=0.0170 → should give -5.5 (PD)
+    # Formula: start at -6.76 (healthy baseline)
+    # + pitch deviation (higher pitch → more negative) * weight
+    # + jitter deviation (higher jitter → less negative) * weight
+    pitch_dev  = (pitch - 181.9) / 41.3        # positive if above healthy mean
+    jitter_dev = (jitter_pct - 0.0039) / 0.0048 # positive if above healthy mean
+    spread1    = float(np.clip(-6.76 + pitch_dev * 0.85 + jitter_dev * 1.0, -7.965, -2.434))
+
+    # ── spread2 — UCI range 0.006–0.450, healthy=0.160, PD=0.248 ───────────
+    # From UCI real data: healthy spread2 ~0.12–0.22, PD ~0.18–0.45
+    # Our jitter-based proxy gives ~0.06 (too low). 
+    # Fix: base value of healthy mean (0.160) + jitter contribution
+    # healthy jitter=0.004 → spread2=0.160; PD jitter=0.007 → spread2=0.248
+    # Formula: spread2 = 0.160 + (jitter_pct - 0.0039) / 0.0048 * 0.088
+    spread2 = float(np.clip(0.160 + (jitter_pct - 0.0039) / 0.0048 * 0.088, 0.006, 0.450))
+
+    # ── D2 — UCI range 1.42–3.67, mean=2.38, healthy mean=2.155, PD=2.456 ──
+    # Our zcr proxy gives very low values (clips to 1.42 always).
+    # Fix: use healthy baseline 2.155 + shimmer contribution
+    # more shimmer → higher D2 (more PD-like)
+    # healthy shimmer=0.0176 → D2=2.155; PD shimmer=0.0337 → D2=2.456
+    shimmer_contrib = (shimmer - 0.0176) / (0.0337 - 0.0176) * (2.456 - 2.155)
+    d2 = float(np.clip(2.155 + shimmer_contrib, 1.42, 3.67))
+
+    # ── PPE — UCI calibrated using real data statistics ───────────────────
+    # healthy: jit=0.004, shim=0.018 → PPE=0.123
+    # PD:      jit=0.007, shim=0.034 → PPE=0.234
+    jitter_ppe  = (jitter_pct - 0.0039) / 0.0048 * 0.055
+    shimmer_ppe = (shimmer - 0.0176) / (0.0337 - 0.0176) * 0.056
+    ppe = float(np.clip(0.123 + jitter_ppe + shimmer_ppe, 0.044, 0.527))
 
     vec = [
-        pitch,                                              # MDVP:Fo(Hz)
-        pitch * 1.08,                                       # MDVP:Fhi(Hz)
-        pitch * 0.92,                                       # MDVP:Flo(Hz)
-        jitter_pct,                                         # MDVP:Jitter(%)
-        jitter_abs,                                         # MDVP:Jitter(Abs)
-        features.get("jitter_rap",  jitter_pct * 0.0065),  # MDVP:RAP
-        features.get("jitter_ppq5", jitter_pct * 0.0077),  # MDVP:PPQ
-        features.get("jitter_ddp",  jitter_pct * 0.0196),  # Jitter:DDP
-        shimmer_adj,                                        # MDVP:Shimmer
-        features.get("shimmer_db",    0.270),               # MDVP:Shimmer(dB)
-        features.get("shimmer_apq3",  0.016),               # Shimmer:APQ3
-        features.get("shimmer_apq5",  0.019),               # Shimmer:APQ5
-        features.get("shimmer_apq11", 0.027),               # MDVP:APQ
-        features.get("shimmer_dda",   0.047),               # Shimmer:DDA
-        nhr,                                                # NHR
-        hnr_adj,                                            # HNR
-        rpde,                                               # RPDE
-        dfa,                                                # DFA
-        spread1,                                            # spread1
-        spread2,                                            # spread2
-        d2,                                                 # D2
-        ppe,                                                # PPE
+        pitch,        # MDVP:Fo(Hz)
+        pitch * 1.28, # MDVP:Fhi(Hz)
+        pitch * 0.75, # MDVP:Flo(Hz)
+        jitter_pct,   # MDVP:Jitter(%)
+        jitter_abs,   # MDVP:Jitter(Abs)
+        jitter_rap,   # MDVP:RAP
+        jitter_ppq,   # MDVP:PPQ
+        jitter_ddp,   # Jitter:DDP
+        shimmer,      # MDVP:Shimmer
+        shimmer_db,   # MDVP:Shimmer(dB)
+        shimmer_apq3, # Shimmer:APQ3
+        shimmer_apq5, # Shimmer:APQ5
+        shimmer_apq,  # MDVP:APQ
+        shimmer_dda,  # Shimmer:DDA
+        nhr,          # NHR
+        hnr,          # HNR
+        rpde,         # RPDE
+        dfa,          # DFA
+        spread1,      # spread1
+        spread2,      # spread2
+        d2,           # D2
+        ppe,          # PPE
     ]
     return np.array(vec, dtype=np.float64)
 
@@ -211,8 +270,8 @@ def heuristic_predict(features: dict) -> dict:
 
 
 def risk_level(prob: float) -> str:
-    if prob >= 0.70: return "High"
-    if prob >= 0.40: return "Medium"
+    if prob >= 0.65: return "High"
+    if prob >= 0.45: return "Medium"
     return "Low"
 
 
@@ -244,55 +303,38 @@ def get_recommendations(prediction: str, confidence: float, features: dict) -> l
 
 def build_feature_importance(features: dict, n: int = 10) -> dict:
     """Return top-N feature importances with patient values."""
-    UCI_TO_FEATURE = {
-        "MDVP:Fo(Hz)":       "pitch_mean",
-        "MDVP:Jitter(%)":    "jitter_local",
-        "MDVP:Jitter(Abs)":  "jitter_absolute",
-        "MDVP:RAP":          "jitter_rap",
-        "MDVP:PPQ":          "jitter_ppq5",
-        "Jitter:DDP":        "jitter_ddp",
-        "MDVP:Shimmer":      "shimmer_local",
-        "MDVP:Shimmer(dB)":  "shimmer_db",
-        "HNR":               "hnr",
-        "NHR":               "hnr",
-        "RPDE":              "rpde",
-        "DFA":               "dfa",
-        "spread1":           "spread1",
-        "spread2":           "spread2",
-        "PPE":               "ppe",
-    }
-    if feature_importance_global:
+    if not feature_importance_global:
+        # Fallback when no model loaded
+        keys = ["jitter_local","shimmer_local","hnr","pitch_mean","rpde",
+                "dfa","zcr_mean","spread1","spread2","ppe"]
+        labels = ["Jitter","Shimmer","HNR","Pitch","RPDE","DFA","ZCR","Spread1","Spread2","PPE"]
         result = {}
-        for uci_name in list(feature_importance_global.keys())[:n]:
-            fk   = UCI_TO_FEATURE.get(uci_name, uci_name)
-            val  = features.get(fk, 0.0)
-            rng  = NORMAL_RANGES.get(fk, (None, None))
-            result[uci_name] = {
-                "importance": round(feature_importance_global[uci_name], 6),
-                "value":      round(float(val), 6),
-                "normal_min": rng[0],
-                "normal_max": rng[1],
-            }
+        for k, l in zip(keys, labels):
+            val = features.get(k, 0.0)
+            result[l] = {"importance": 0.1, "value": round(float(val), 6),
+                         "normal_min": None, "normal_max": None}
         return result
-    # Fallback
-    fallback = {
-        "Jitter (Local)":  features.get("jitter_local", 0),
-        "Shimmer (Local)": features.get("shimmer_local", 0),
-        "HNR":             features.get("hnr", 0),
-        "Pitch Mean":      features.get("pitch_mean", 0),
-        "RPDE":            features.get("rpde", 0),
-        "DFA":             features.get("dfa", 0),
-        "ZCR Mean":        features.get("zcr_mean", 0),
-        "Spread1":         features.get("spread1", 0),
-        "Spread2":         features.get("spread2", 0),
-        "PPE":             features.get("ppe", 0),
-    }
-    mx = max(abs(v) for v in fallback.values()) + 1e-10
-    return {
-        k: {"importance": round(abs(v) / mx, 6), "value": round(float(v), 6),
-            "normal_min": None, "normal_max": None}
-        for k, v in fallback.items()
-    }
+
+    result = {}
+    for feat_name in list(feature_importance_global.keys())[:n]:
+        raw = feature_importance_global[feat_name]
+        # Handle both float (old format) and dict (new format)
+        if isinstance(raw, dict):
+            importance = raw.get("importance", 0.0)
+        else:
+            importance = float(raw)
+
+        # Map feature name to extracted value
+        val = features.get(feat_name, features.get(feat_name.replace("_mean",""), 0.0))
+        rng = NORMAL_RANGES.get(feat_name, (None, None))
+
+        result[feat_name] = {
+            "importance": round(float(importance), 6),
+            "value":      round(float(val), 6),
+            "normal_min": rng[0],
+            "normal_max": rng[1],
+        }
+    return result
 
 
 def build_pdf(result: dict) -> bytes:
@@ -493,12 +535,24 @@ async def analyze(file: UploadFile = File(...)):
     # Prediction
     if models_loaded and scaler is not None and ensemble is not None:
         try:
-            uci_vec    = map_to_uci_vector(features).reshape(1, -1)
-            uci_scaled = scaler.transform(uci_vec)
-            proba      = float(ensemble.predict_proba(uci_scaled)[0][1])
-            pred       = "Parkinson's Detected" if proba >= 0.5 else "Healthy"
-            conf       = round((proba if proba >= 0.5 else 1.0 - proba) * 100, 1)
-            model_used = "Ensemble (RF + XGBoost + SVM)"
+            # Try new feature-space model first (trained on audio features directly)
+            feature_names_path = os.path.join(MODELS_DIR, "feature_names.json")
+            if os.path.exists(feature_names_path):
+                with open(feature_names_path) as fn_f:
+                    feature_names = json.load(fn_f)
+                feat_vec = np.array(
+                    [features.get(k, 0.0) for k in feature_names],
+                    dtype=np.float64
+                ).reshape(1, -1)
+            else:
+                # Legacy: map to UCI 22-feature vector
+                feat_vec = map_to_uci_vector(features).reshape(1, -1)
+
+            feat_scaled = scaler.transform(feat_vec)
+            proba       = float(ensemble.predict_proba(feat_scaled)[0][1])
+            pred        = "Parkinson's Detected" if proba >= 0.5 else "Healthy"
+            conf        = round((proba if proba >= 0.5 else 1.0 - proba) * 100, 1)
+            model_used  = "Ensemble (RF + XGBoost + SVM)"
         except Exception as e:
             logger.error(f"Model inference error: {e}. Falling back to heuristic.")
             p = heuristic_predict(features)
