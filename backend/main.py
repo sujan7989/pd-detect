@@ -114,23 +114,31 @@ def map_to_uci_vector(features: dict) -> np.ndarray:
     # ── Pitch ──────────────────────────────────────────────────────────────
     pitch = float(np.clip(features.get("pitch_mean", 154.0), 50.0, 400.0))
 
-    # ── Jitter — SAME scale as UCI (both are proportions 0.001–0.033) ──────
+    # ── Jitter mapping ──────────────────────────────────────────────────────
+    # Browser WebM zero-crossing jitter is inflated vs clinical MDVP.
+    # Calibration factor depends on recording quality:
+    # - High pitch_std (> 15 Hz) = natural speech, large variation, use larger divisor
+    # - Low pitch_std (< 5 Hz)   = sustained vowel, small variation, use smaller divisor
+    # Adaptive divisor: 8 to 20 based on pitch_std
+    pitch_std_val = float(features.get("pitch_std", 5.0))
+    # If pitch_std > 20 Hz, voice had lots of natural variation → use divisor 20
+    # If pitch_std < 5 Hz, voice was very stable → use divisor 8
+    divisor    = float(np.clip(8.0 + (pitch_std_val / 20.0) * 12.0, 8.0, 30.0))
     raw_jitter = float(features.get("jitter_local", 0.004))
-    jitter_pct = float(np.clip(raw_jitter, 0.0017, 0.0330))   # UCI range
+    jitter_pct = float(np.clip(raw_jitter / divisor, 0.0017, 0.0330))
 
-    jitter_abs = float(np.clip(features.get("jitter_absolute", raw_jitter / 200),
+    jitter_abs = float(np.clip(features.get("jitter_absolute", jitter_pct / 200),
                                0.0, 0.000290))
-    jitter_rap = float(np.clip(features.get("jitter_rap", raw_jitter * 0.50),
-                               0.0, 0.0210))
-    jitter_ppq = float(np.clip(features.get("jitter_ppq5", raw_jitter * 0.55),
-                               0.0, 0.0190))
+    jitter_rap = float(np.clip(jitter_pct * 0.50, 0.0, 0.0210))
+    jitter_ppq = float(np.clip(jitter_pct * 0.55, 0.0, 0.0190))
     jitter_ddp = jitter_rap * 3.0
 
-    # ── Shimmer — divide by 2.0 (not 2.5, previous was over-correcting) ────
-    # Diagnosis: shimmer 0.012 / 2.5 = 0.0048 (below UCI min 0.0095)
-    # Use 2.0: shimmer 0.015 / 2.0 = 0.0075 → clips to 0.0095 (UCI min)
+    # ── Shimmer — adaptive scaling like jitter ─────────────────────────────
+    # Browser WebM shimmer is inflated. Use pitch_std-adaptive divisor.
+    # Higher pitch_std → more natural speech → more variation → larger divisor
+    shimmer_divisor = float(np.clip(2.0 + (pitch_std_val / 30.0) * 2.0, 2.0, 5.0))
     raw_shimmer  = float(features.get("shimmer_local", 0.025))
-    shimmer      = float(np.clip(raw_shimmer / 2.0, 0.0095, 0.119))
+    shimmer      = float(np.clip(raw_shimmer / shimmer_divisor, 0.0095, 0.119))
     shimmer_db   = float(np.clip(features.get("shimmer_db", shimmer * 9.0), 0.048, 2.28))
     shimmer_apq3 = float(np.clip(features.get("shimmer_apq3", shimmer * 0.53), 0.0, 0.056))
     shimmer_apq5 = float(np.clip(features.get("shimmer_apq5", shimmer * 0.60), 0.0, 0.079))
@@ -164,25 +172,14 @@ def map_to_uci_vector(features: dict) -> np.ndarray:
     dfa     = float(np.clip(raw_dfa * 0.40 + 0.51, 0.574, 0.826))
 
     # ── spread1 — UCI range -7.96 to -2.43, healthy=-6.76, PD=-5.33 ────────
-    # Key: spread1 in UCI is related to fundamental frequency variation.
-    # Higher pitch + lower jitter → more negative (more healthy).
-    # Calibration based on diagnosis output:
-    #   pitch=182, jitter=0.0026 → should give -6.5 (healthy)
-    #   pitch=160, jitter=0.0027 → should give -6.2 (still healthy, lower pitch)
-    #   pitch=145, jitter=0.0170 → should give -5.5 (PD)
-    # Formula: start at -6.76 (healthy baseline)
-    # + pitch deviation (higher pitch → more negative) * weight
-    # + jitter deviation (higher jitter → less negative) * weight
-    pitch_dev  = (pitch - 181.9) / 41.3        # positive if above healthy mean
-    jitter_dev = (jitter_pct - 0.0039) / 0.0048 # positive if above healthy mean
-    spread1    = float(np.clip(-6.76 + pitch_dev * 0.85 + jitter_dev * 1.0, -7.965, -2.434))
+    # pitch deviation: normalize to UCI distribution, cap contribution
+    pitch_dev  = float(np.clip((pitch - 181.9) / 41.3, -2.0, 2.0))
+    # jitter deviation: use calibrated jitter_pct
+    jitter_dev = float(np.clip((jitter_pct - 0.0039) / 0.0048, -1.0, 2.0))
+    spread1    = float(np.clip(-6.76 + pitch_dev * 0.85 + jitter_dev * 0.7, -7.965, -2.434))
 
     # ── spread2 — UCI range 0.006–0.450, healthy=0.160, PD=0.248 ───────────
-    # From UCI real data: healthy spread2 ~0.12–0.22, PD ~0.18–0.45
-    # Our jitter-based proxy gives ~0.06 (too low). 
-    # Fix: base value of healthy mean (0.160) + jitter contribution
-    # healthy jitter=0.004 → spread2=0.160; PD jitter=0.007 → spread2=0.248
-    # Formula: spread2 = 0.160 + (jitter_pct - 0.0039) / 0.0048 * 0.088
+    # Based on calibrated jitter_pct (already divided by 8)
     spread2 = float(np.clip(0.160 + (jitter_pct - 0.0039) / 0.0048 * 0.088, 0.006, 0.450))
 
     # ── D2 — UCI range 1.42–3.67, mean=2.38, healthy mean=2.155, PD=2.456 ──
