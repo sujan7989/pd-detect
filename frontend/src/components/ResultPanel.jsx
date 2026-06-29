@@ -148,7 +148,7 @@ export default function ResultPanel({ result }) {
 
             {/* Confidence ring */}
             <div className="flex-shrink-0">
-              <ConfidenceRing confidence={result.confidence} isPD={isPD} size={150} />
+              <ConfidenceRing confidence={result.confidence ?? 50} isPD={isPD} size={150} />
             </div>
           </div>
         </div>

@@ -238,8 +238,10 @@ export default function HistoryPage() {
 
   const filtered = history.filter((item) => {
     const isPD = item.prediction?.includes("Parkinson");
-    if (filter === "pd" && !isPD) return false;
-    if (filter === "healthy" && isPD) return false;
+    // Apply tab filter first
+    if (filter === "pd"      && !isPD) return false;
+    if (filter === "healthy" &&  isPD) return false;
+    // Then apply search on top
     if (search) {
       const q = search.toLowerCase();
       return (

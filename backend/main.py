@@ -133,11 +133,12 @@ def map_to_uci_vector(features: dict) -> np.ndarray:
 
     # ── Other features
     jitter_abs  = features.get("jitter_absolute", 0.00003)
-    rpde   = float(np.clip(features.get("rpde",    0.50), 0.0, 1.0))
-    dfa    = float(np.clip(features.get("dfa",     0.70), 0.5, 0.9))
+    rpde   = float(np.clip(features.get("rpde",    0.50), 0.0,  1.0))
+    dfa    = float(np.clip(features.get("dfa",     0.70), 0.5,  0.9))
     spread1= float(np.clip(features.get("spread1", -5.5), -8.0, -2.0))
-    spread2= float(np.clip(features.get("spread2",  0.20), 0.0, 0.5))
-    ppe    = float(np.clip(features.get("ppe",      0.20), 0.0, 0.6))
+    # spread2 and ppe from feature_extractor are log-scale negatives — keep them
+    spread2= float(np.clip(features.get("spread2", -2.5), -8.0, -0.5))
+    ppe    = float(np.clip(features.get("ppe",     -1.7), -7.0, -0.5))
     d2     = float(np.clip(features.get("zcr_mean", 0.05) * 40.0, 1.5, 4.0))
 
     vec = [

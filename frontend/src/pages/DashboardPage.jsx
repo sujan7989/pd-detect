@@ -308,17 +308,17 @@ export default function DashboardPage() {
                   }}
                 />
                 <YAxis domain={[0, 100]} tick={TICK} unit="%" />
-                <Tooltip
-                  contentStyle={TIP.contentStyle}
-                  cursor={TIP.cursor}
-                  formatter={(v) => [`${v.toFixed(1)}%`, "Confidence"]}
-                />
                 <defs>
                   <linearGradient id="lineGrad" x1="0" y1="0" x2="1" y2="0">
                     <stop offset="0%"   stopColor="#8b5cf6" />
                     <stop offset="100%" stopColor="#06b6d4" />
                   </linearGradient>
                 </defs>
+                <Tooltip
+                  contentStyle={TIP.contentStyle}
+                  cursor={TIP.cursor}
+                  formatter={(v) => [`${v.toFixed(1)}%`, "Confidence"]}
+                />
                 <Line
                   type="monotone"
                   dataKey="confidence"
@@ -357,6 +357,12 @@ export default function DashboardPage() {
                     type="category"
                     tick={{ ...TICK, fill: "rgba(255,255,255,0.45)" }}
                   />
+                  <defs>
+                    <linearGradient id="barGrad" x1="0" y1="0" x2="1" y2="0">
+                      <stop offset="0%"   stopColor="#8b5cf6" stopOpacity={0.9} />
+                      <stop offset="100%" stopColor="#06b6d4" stopOpacity={0.9} />
+                    </linearGradient>
+                  </defs>
                   <Tooltip
                     contentStyle={TIP.contentStyle}
                     cursor={TIP.cursor}
@@ -367,12 +373,6 @@ export default function DashboardPage() {
                     fill="url(#barGrad)"
                     name="Avg Value"
                   />
-                  <defs>
-                    <linearGradient id="barGrad" x1="0" y1="0" x2="1" y2="0">
-                      <stop offset="0%"   stopColor="#8b5cf6" stopOpacity={0.9} />
-                      <stop offset="100%" stopColor="#06b6d4" stopOpacity={0.9} />
-                    </linearGradient>
-                  </defs>
                 </BarChart>
               </ResponsiveContainer>
             </div>
