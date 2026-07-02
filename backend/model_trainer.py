@@ -42,42 +42,49 @@ UCI_FEATURES = [
 ]
 
 
-def augment_uci(df, n_augments=10, noise_scale=0.04, seed=42):
+def augment_uci(df, noise_scale=0.08, seed=42):
     """
-    Augment UCI data by adding small Gaussian noise (±4% of std per feature).
-    This creates realistic variation while preserving clinical distributions.
-    Oversample healthy class (minority) more aggressively to balance classes.
+    Augment UCI data by adding small Gaussian noise (+-4% of std per feature).
+    Target: exactly 50/50 class balance so no model needs pos_weight correction.
     """
     rng = np.random.default_rng(seed)
     feat_df = df[UCI_FEATURES].values.astype(np.float64)
     labels  = df["status"].values
 
-    stds = feat_df.std(axis=0)
+    stds = np.clip(feat_df.std(axis=0), 1e-9, None)
 
-    augmented_X = [feat_df]
-    augmented_y = [labels]
+    pd_idx = np.where(labels == 1)[0]   # 147 PD
+    he_idx = np.where(labels == 0)[0]   #  48 Healthy
 
-    # PD samples: augment n_augments times
-    pd_idx = np.where(labels == 1)[0]
-    for i in range(n_augments):
-        noise = rng.normal(0, noise_scale, feat_df[pd_idx].shape) * stds
-        augmented_X.append(feat_df[pd_idx] + noise)
-        augmented_y.append(labels[pd_idx])
+    # Augment both classes to exactly 1500 samples each
+    target_each = 1500
 
-    # Healthy samples: augment MORE (3x) to balance 1:3 ratio
-    he_idx = np.where(labels == 0)[0]
-    for i in range(n_augments * 3):
-        noise = rng.normal(0, noise_scale, feat_df[he_idx].shape) * stds
-        augmented_X.append(feat_df[he_idx] + noise)
-        augmented_y.append(labels[he_idx])
+    def oversample(idx, target, label_val):
+        base_X = feat_df[idx]
+        base_y = labels[idx]
+        Xs = [base_X]
+        ys = [base_y]
+        needed = target - len(idx)
+        while needed > 0:
+            take = min(needed, len(idx))
+            chosen = rng.choice(len(idx), take, replace=True)
+            noise = rng.normal(0, noise_scale, (take, feat_df.shape[1])) * stds
+            Xs.append(base_X[chosen] + noise)
+            ys.append(np.full(take, label_val))
+            needed -= take
+        return np.vstack(Xs), np.concatenate(ys)
 
-    X = np.vstack(augmented_X)
-    y = np.concatenate(augmented_y)
+    pd_X, pd_y = oversample(pd_idx, target_each, 1)
+    he_X, he_y = oversample(he_idx, target_each, 0)
+
+    X = np.vstack([pd_X, he_X])
+    y = np.concatenate([pd_y, he_y])
     print(f"  After augmentation: {len(X)} samples | PD: {sum(y==1)} | Healthy: {sum(y==0)}")
     return X, y
 
 
 def train(X, y):
+    # Classes are 50/50 balanced after augmentation — no weights needed
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.15, random_state=42, stratify=y
     )
@@ -88,43 +95,41 @@ def train(X, y):
     Xtr_sc     = scaler.fit_transform(X_train)
     Xte_sc     = scaler.transform(X_test)
 
-    # ── 1. Random Forest ─────────────────────────────────────────────────
+    # ── 1. Random Forest (no class_weight needed — balanced data) ─────────
     print("\n[1/4] Random Forest...")
     rf = RandomForestClassifier(
-        n_estimators=500, max_depth=None, min_samples_leaf=2,
-        class_weight="balanced", random_state=42, n_jobs=-1
+        n_estimators=300, max_depth=7, min_samples_leaf=8,
+        random_state=42, n_jobs=-1
     )
     rf.fit(Xtr_sc, y_train)
     _report("RF", rf, Xte_sc, y_test)
 
-    # ── 2. XGBoost ────────────────────────────────────────────────────────
+    # ── 2. XGBoost (scale_pos_weight=1 — balanced data) ───────────────────
     print("[2/4] XGBoost...")
-    n_he = int(sum(y_train == 0))
-    n_pd = int(sum(y_train == 1))
     xgb_m = xgb.XGBClassifier(
-        n_estimators=500, max_depth=4, learning_rate=0.03,
-        subsample=0.8, colsample_bytree=0.8,
-        scale_pos_weight=n_he / max(n_pd, 1),
+        n_estimators=300, max_depth=3, learning_rate=0.05,
+        subsample=0.75, colsample_bytree=0.75,
+        scale_pos_weight=1.0,
         eval_metric="logloss", random_state=42, verbosity=0,
-        reg_alpha=0.1, reg_lambda=1.0
+        reg_alpha=0.3, reg_lambda=1.5,
+        min_child_weight=8
     )
     xgb_m.fit(Xtr_sc, y_train)
     _report("XGB", xgb_m, Xte_sc, y_test)
 
-    # ── 3. SVM (calibrated) ───────────────────────────────────────────────
+    # ── 3. SVM with Platt calibration ────────────────────────────────────
     print("[3/4] SVM (calibrated)...")
     svm = CalibratedClassifierCV(
-        SVC(kernel="rbf", C=8, gamma="scale",
-            class_weight="balanced", random_state=42),
-        cv=5, method="isotonic"
+        SVC(kernel="rbf", C=5, gamma="scale", random_state=42),
+        cv=5, method="sigmoid"  # Platt scaling — better calibrated probabilities
     )
     svm.fit(Xtr_sc, y_train)
     _report("SVM", svm, Xte_sc, y_test)
 
-    # ── 4. Gradient Boosting (extra estimator for ensemble) ───────────────
+    # ── 4. Gradient Boosting ──────────────────────────────────────────────
     print("[4/4] Gradient Boosting...")
     gb = GradientBoostingClassifier(
-        n_estimators=300, max_depth=3, learning_rate=0.05,
+        n_estimators=200, max_depth=3, learning_rate=0.08,
         subsample=0.8, random_state=42
     )
     gb.fit(Xtr_sc, y_train)
@@ -134,7 +139,7 @@ def train(X, y):
     print("\nEnsemble (soft voting: RF+XGB+SVM+GB)...")
     ensemble = VotingClassifier(
         estimators=[("rf", rf), ("xgb", xgb_m), ("svm", svm), ("gb", gb)],
-        voting="soft", weights=[2, 2, 1, 2]   # weight RF/XGB/GB higher
+        voting="soft", weights=[2, 2, 1, 1]
     )
     ensemble.fit(Xtr_sc, y_train)
 
@@ -152,6 +157,22 @@ def train(X, y):
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     cv_sc = cross_val_score(ensemble, Xtr_sc, y_train, cv=cv, scoring="balanced_accuracy")
     print(f"  5-fold balanced CV: {cv_sc.mean():.4f} ± {cv_sc.std():.4f}")
+
+    # ── Post-training calibration check ────────────────────────────────
+    # Verify that UCI healthy means → Healthy, UCI PD means → PD
+    healthy_uci = np.array([181.94, 233.0, 136.5,
+        0.00387, 2.3e-5, 0.00193, 0.00206, 0.00578,
+        0.01762, 0.16296, 0.00950, 0.01051, 0.01330, 0.02851,
+        0.01148, 24.679, 0.44255, 0.69572, -6.7593, 0.16029, 2.1545, 0.12302]).reshape(1,-1)
+    pd_uci = np.array([145.18, 188.44, 108.89,
+        0.00699, 5.07e-5, 0.00376, 0.00390, 0.01127,
+        0.03366, 0.32120, 0.01768, 0.02028, 0.02760, 0.05303,
+        0.02921, 20.974, 0.51682, 0.72541, -5.3334, 0.24813, 2.4561, 0.23383]).reshape(1,-1)
+    h_p = float(ensemble.predict_proba(scaler.transform(healthy_uci))[0][1])
+    pd_p = float(ensemble.predict_proba(scaler.transform(pd_uci))[0][1])
+    print(f"\n  [CALIBRATION CHECK]")
+    print(f"  UCI Healthy means -> PD prob: {h_p:.4f}  -> {'PASS (Healthy)' if h_p < 0.5 else 'FAIL (predicted PD!)'}")
+    print(f"  UCI PD means      -> PD prob: {pd_p:.4f}  -> {'PASS (PD)' if pd_p >= 0.5 else 'FAIL (predicted Healthy!)'}")
 
     # Feature importances (RF + XGB combined)
     fi_rf  = rf.feature_importances_
@@ -197,7 +218,7 @@ def main():
 
     # ── Augment to balanced dataset ───────────────────────────────────────
     print("Augmenting and balancing dataset...")
-    X, y = augment_uci(df, n_augments=10, noise_scale=0.04)
+    X, y = augment_uci(df, noise_scale=0.05)
     print()
 
     # ── Train ─────────────────────────────────────────────────────────────
