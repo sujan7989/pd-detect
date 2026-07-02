@@ -2,12 +2,14 @@ import React, { useState, useEffect, useCallback } from "react";
 import {
   BarChart2, TrendingUp, Activity, Brain,
   RefreshCw, ShieldAlert, ShieldCheck, Database, Zap,
+  FlaskConical, Loader2,
 } from "lucide-react";
 import {
   LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from "recharts";
-import { getLocalHistory, getStats } from "../api/client.js";
+import { getLocalHistory, getStats, seedDemoData } from "../api/client.js";
+import toast from "react-hot-toast";
 
 const TIP = {
   contentStyle: {
@@ -27,6 +29,7 @@ export default function DashboardPage() {
   const [stats,   setStats]   = useState(null);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [seeding, setSeeding] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -170,14 +173,40 @@ export default function DashboardPage() {
             Dashboard
           </h1>
         </div>
-        <button
-          onClick={load}
-          disabled={loading}
-          className="btn-secondary-glass flex items-center gap-2 text-sm px-4 py-2.5"
-        >
-          <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={async () => {
+              setSeeding(true);
+              try {
+                const data = await seedDemoData();
+                toast.success(`${data.seeded} demo analyses loaded!`);
+                setHistory(getLocalHistory());
+                const s = await getStats();
+                setStats(s);
+              } catch {
+                toast.error("Failed to load demo data. Is the server running?");
+              } finally {
+                setSeeding(false);
+              }
+            }}
+            disabled={seeding}
+            className="btn-secondary-glass flex items-center gap-2 text-sm px-4 py-2.5"
+          >
+            {seeding ? (
+              <><Loader2 className="w-4 h-4 animate-spin" /> Loading...</>
+            ) : (
+              <><FlaskConical className="w-4 h-4" /> Load Demo Data</>
+            )}
+          </button>
+          <button
+            onClick={load}
+            disabled={loading}
+            className="btn-secondary-glass flex items-center gap-2 text-sm px-4 py-2.5"
+          >
+            <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* Summary cards */}

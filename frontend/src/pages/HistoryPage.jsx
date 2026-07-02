@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import {
   History, RefreshCw, Trash2, ChevronDown, ChevronUp,
   ShieldAlert, ShieldCheck, Calendar, Loader2, ClipboardX,
-  FileDown, Search, X, Hash,
+  FileDown, Search, X, Hash, FlaskConical,
 } from "lucide-react";
 import toast from "react-hot-toast";
 import {
@@ -10,6 +10,7 @@ import {
   clearLocalHistory,
   deleteLocalEntry,
   downloadReport,
+  seedDemoData,
 } from "../api/client.js";
 
 function HistoryItem({ item, onDelete }) {
@@ -204,6 +205,7 @@ export default function HistoryPage() {
   const [clearing, setClearing] = useState(false);
   const [filter,   setFilter]   = useState("all");
   const [search,   setSearch]   = useState("");
+  const [seeding,  setSeeding]  = useState(false);
 
   // Load from localStorage
   const load = useCallback(() => {
@@ -392,6 +394,35 @@ export default function HistoryPage() {
             )}
           </button>
         )}
+
+        <button
+          onClick={async () => {
+            setSeeding(true);
+            try {
+              const data = await seedDemoData();
+              toast.success(`${data.seeded} demo analyses loaded!`);
+              setHistory(getLocalHistory());
+            } catch {
+              toast.error("Failed to load demo data.");
+            } finally {
+              setSeeding(false);
+            }
+          }}
+          disabled={seeding}
+          className="btn-secondary-glass flex items-center gap-2 text-sm px-4 py-2.5"
+        >
+          {seeding ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Loading…
+            </>
+          ) : (
+            <>
+              <FlaskConical className="w-4 h-4" />
+              Demo Data
+            </>
+          )}
+        </button>
       </div>
 
       {/* Loading skeleton */}

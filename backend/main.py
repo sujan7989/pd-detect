@@ -741,10 +741,14 @@ async def analyze(file: UploadFile = File(...)):
                 hnr = features.get("hnr", 20.0)
                 
                 # Count how many biomarkers are in PD clinical range
+                # Ranges cover mild to severe PD:
+                #   jitter 0.5-5% (mild ~1%, severe ~3-4%)
+                #   shimmer 3-15% (mild ~5%, severe ~10-12%)
+                #   pitch_std 8-35Hz, HNR 6-20dB
                 pd_biomarkers = 0
-                if 0.005 <= jitter <= 0.03:   # 0.5-3% jitter
+                if 0.005 <= jitter <= 0.05:   # 0.5-5% jitter
                     pd_biomarkers += 1
-                if 0.03 <= shimmer <= 0.10:    # 3-10% shimmer
+                if 0.03 <= shimmer <= 0.15:    # 3-15% shimmer
                     pd_biomarkers += 1
                 if 8.0 <= pitch_std <= 35.0:   # 8-35 Hz pitch_std
                     pd_biomarkers += 1
@@ -881,6 +885,174 @@ async def generate_report(request: Request):
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
+# ─── Demo Data Generation ─────────────────────────────────────────────────────
+
+def _generate_synthetic_wav(f0=165.0, noise=0.02, jitter_amount=0.0,
+                            shimmer_amount=0.0, duration=3.0, sr=22050, seed=None):
+    """Generate a synthetic sustained-vowel WAV buffer.
+    Returns bytes suitable for extract_features().
+    """
+    import wave as _wave
+    if seed is not None:
+        np.random.seed(seed)
+    n_samples = int(sr * duration)
+    t = np.arange(n_samples) / sr
+
+    # Per-cycle bounded jitter
+    base_period = 1.0 / f0
+    phase = np.zeros(n_samples)
+    current_phase = 0.0
+    i = 0
+    while i < n_samples:
+        if jitter_amount > 0:
+            delta_T = np.random.randn() * base_period * jitter_amount
+            delta_T = np.clip(delta_T, -3 * base_period * jitter_amount,
+                              3 * base_period * jitter_amount)
+            this_period = base_period + delta_T
+        else:
+            this_period = base_period
+        samples_in_cycle = min(max(1, int(this_period * sr)), n_samples - i)
+        cycle_phase = 2 * np.pi * (np.arange(samples_in_cycle) / samples_in_cycle)
+        phase[i:i + samples_in_cycle] = current_phase + cycle_phase
+        current_phase += 2 * np.pi
+        i += samples_in_cycle
+
+    # Harmonic signal
+    signal = (0.5 * np.sin(phase)
+            + 0.2 * np.sin(2 * phase)
+            + 0.1 * np.sin(3 * phase)
+            + 0.05 * np.sin(4 * phase))
+
+    # Amplitude shimmer
+    if shimmer_amount > 0:
+        amp_noise = np.random.randn(n_samples)
+        ks = max(1, int(sr / f0))
+        amp_noise = np.convolve(amp_noise, np.ones(ks) / ks, 'same')
+        amp_mod = 1.0 + shimmer_amount * amp_noise / (np.std(amp_noise) + 1e-9)
+        signal *= amp_mod
+
+    # Noise floor
+    signal += noise * np.random.randn(n_samples)
+
+    # Fade-in / fade-out envelope
+    fade = int(0.05 * sr)
+    envelope = np.ones_like(t)
+    envelope[:fade] = np.linspace(0, 1, fade)
+    envelope[-fade:] = np.linspace(1, 0, fade)
+    signal *= envelope
+
+    # Normalize to 16-bit PCM WAV
+    signal = signal / (np.max(np.abs(signal)) + 1e-9) * 0.8
+    pcm = (signal * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with _wave.open(buf, 'w') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+    buf.seek(0)
+    return buf.read()
+
+
+_DEMO_PROFILES = [
+    # Healthy voices
+    {"label": "Healthy Male (165 Hz)",        "f0": 165, "noise": 0.02, "jitter": 0.0,   "shimmer": 0.0,  "seed": 100},
+    {"label": "Healthy Female (220 Hz)",      "f0": 220, "noise": 0.02, "jitter": 0.0,   "shimmer": 0.0,  "seed": 101},
+    {"label": "Healthy Low-Pitch Male (120 Hz)", "f0": 120, "noise": 0.03, "jitter": 0.0, "shimmer": 0.0, "seed": 102},
+    # PD voices (clinically realistic)
+    {"label": "PD Mild (1.2% jitter)",       "f0": 150, "noise": 0.05, "jitter": 0.012, "shimmer": 0.06, "seed": 200},
+    {"label": "PD Moderate (2.2% jitter)",   "f0": 145, "noise": 0.08, "jitter": 0.022, "shimmer": 0.10, "seed": 201},
+    {"label": "PD Severe (3.5% jitter)",     "f0": 140, "noise": 0.12, "jitter": 0.035, "shimmer": 0.15, "seed": 202},
+]
+
+
+@app.post("/seed-demo")
+async def seed_demo_data():
+    """Generate synthetic audio for healthy + PD profiles, analyze each,
+    store results in history, and return all results for the frontend."""
+    if not models_loaded:
+        raise HTTPException(status_code=503, detail="Models not loaded yet.")
+
+    results = []
+    for profile in _DEMO_PROFILES:
+        wav_bytes = _generate_synthetic_wav(
+            f0=profile["f0"],
+            noise=profile["noise"],
+            jitter_amount=profile["jitter"],
+            shimmer_amount=profile["shimmer"],
+            duration=3.0,
+            seed=profile["seed"],
+        )
+        # Extract features
+        try:
+            features = extract_features(wav_bytes)
+        except Exception as e:
+            logger.error(f"Demo feature extraction failed for {profile['label']}: {e}")
+            continue
+
+        # Run prediction (same logic as /analyze)
+        try:
+            feat_vec = map_to_uci_vector(features).reshape(1, -1)
+            feat_scaled = scaler.transform(feat_vec)
+            proba = float(ensemble.predict_proba(feat_scaled)[0][1])
+
+            quality, is_corrupted = _assess_signal_quality(features)
+            PD_THRESHOLD = 0.65
+
+            if is_corrupted:
+                proba = min(proba, 0.30)
+            else:
+                jitter = features.get("jitter_local", 0.005)
+                shimmer = features.get("shimmer_local", 0.02)
+                pitch_std = features.get("pitch_std", 5.0)
+                hnr = features.get("hnr", 20.0)
+                pd_bio = sum([
+                    0.005 <= jitter <= 0.05,
+                    0.03 <= shimmer <= 0.15,
+                    8.0 <= pitch_std <= 35.0,
+                    6.0 <= hnr <= 20.0,
+                ])
+                if pd_bio >= 3 and proba < PD_THRESHOLD:
+                    proba = min(proba + (0.35 if pd_bio == 3 else 0.50), 0.95)
+
+            pred = "Parkinson's Detected" if proba >= PD_THRESHOLD else "Healthy"
+            conf = round((proba if proba >= PD_THRESHOLD else 1.0 - proba) * 100, 1)
+            quality_tag = "CORRUPTED" if is_corrupted else f"q={quality:.0%}"
+            model_used = f"Ensemble (RF + XGBoost + SVM + GB) [{quality_tag}, thr={PD_THRESHOLD:.2f}]"
+        except Exception as e:
+            logger.error(f"Demo prediction failed: {e}")
+            p = heuristic_predict(features)
+            pred, proba, conf, model_used = p["prediction"], p["probability"], p["confidence"], p["model_used"]
+
+        recs = get_recommendations(pred, conf, features)
+        fimp = build_feature_importance(features)
+
+        result = {
+            "id":                 str(uuid.uuid4())[:8].upper(),
+            "timestamp":          datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "prediction":         pred,
+            "confidence":         conf,
+            "probability":        round(proba, 4),
+            "risk_level":         risk_level(proba),
+            "features":           {k: round(float(v), 6) for k, v in features.items()},
+            "feature_importance": fimp,
+            "recommendations":    recs,
+            "model_used":         model_used,
+            "demo_label":         profile["label"],
+        }
+        analysis_history.append(result)
+        results.append(result)
+
+    if len(analysis_history) > MAX_HISTORY:
+        del analysis_history[:-MAX_HISTORY]
+
+    return {
+        "seeded": len(results),
+        "results": results,
+        "message": f"{len(results)} demo analyses added to history.",
+    }
 
 
 if __name__ == "__main__":

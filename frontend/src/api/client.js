@@ -58,6 +58,14 @@ export const deleteLocalEntry = (id) => {
 export const checkHealth = () => api.get("/health").then((r) => r.data);
 export const getStats    = () => api.get("/stats").then((r) => r.data);
 
+export const seedDemoData = () =>
+  api.post("/seed-demo").then((r) => {
+    // Store each result in localStorage history
+    const results = r.data.results || [];
+    results.forEach((entry) => saveToLocalHistory(entry));
+    return r.data;
+  });
+
 export const analyzeAudio = (blob, filename, onProgress) => {
   const form = new FormData();
   form.append("file", blob, filename);
