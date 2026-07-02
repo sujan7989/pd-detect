@@ -311,6 +311,78 @@ def map_to_uci_vector(features: dict) -> np.ndarray:
     ]
     return np.array(vec, dtype=np.float64)
 
+
+def _assess_signal_quality(features: dict) -> tuple:
+    """
+    Assess the quality/reliability of the audio signal for PD analysis.
+    Returns (quality_score, is_corrupted).
+    
+    quality_score: 0 (terrible) to 1 (excellent) — used for informational purposes.
+    is_corrupted: True if features are physiologically impossible (noise, not PD).
+    
+    Clinical reality:
+    - Healthy: jitter < 1%, shimmer < 3%, pitch_std < 10Hz, HNR > 20dB
+    - PD:      jitter 0.5-3%, shimmer 3-8%, pitch_std 10-30Hz, HNR 10-20dB
+    - Noise:   jitter > 5%, shimmer > 10%, pitch_std > 50Hz, HNR < 5dB
+    
+    Values far beyond PD ranges indicate environmental noise corruption,
+    NOT genuine Parkinson's symptoms.
+    """
+    hnr = features.get("hnr", 20.0)
+    pitch_std = features.get("pitch_std", 5.0)
+    jitter = features.get("jitter_local", 0.005)
+    shimmer = features.get("shimmer_local", 0.02)
+    
+    # ── Clinical plausibility check ──────────────────────────────────
+    # If jitter/shimmer are far beyond what any human voice can produce,
+    # the signal is corrupted by noise. No ML model can give reliable
+    # results from corrupted data.
+    #
+    # Physiological limits:
+    #   jitter_local > 5%  → impossible for real voice (even severe PD < 3%)
+    #   shimmer_local > 12% → impossible for real voice (even severe PD < 10%)
+    #   pitch_std > 80Hz   → indicates pitch tracking errors from noise
+    is_corrupted = (
+        jitter > 0.05 or       # > 5% jitter = noise corruption
+        shimmer > 0.12 or      # > 12% shimmer = noise corruption
+        (pitch_std > 80 and jitter > 0.02)  # extreme pitch instability + some jitter
+    )
+    
+    # ── Informational quality score (0-1) ────────────────────────────
+    hnr_quality = max(0.0, min(1.0, (hnr - 3.0) / 17.0))
+    
+    if pitch_std <= 30:
+        pitch_quality = 1.0
+    elif pitch_std <= 80:
+        pitch_quality = 1.0 - (pitch_std - 30) / 100.0
+    else:
+        pitch_quality = max(0.0, 1.0 - (pitch_std - 30) / 120.0)
+    
+    if jitter <= 0.03:
+        jitter_quality = 1.0
+    elif jitter <= 0.08:
+        jitter_quality = 1.0 - (jitter - 0.03) / 0.10
+    else:
+        jitter_quality = max(0.0, 1.0 - (jitter - 0.03) / 0.30)
+    
+    if shimmer <= 0.06:
+        shimmer_quality = 1.0
+    elif shimmer <= 0.12:
+        shimmer_quality = 1.0 - (shimmer - 0.06) / 0.12
+    else:
+        shimmer_quality = max(0.0, 1.0 - (shimmer - 0.06) / 0.30)
+    
+    quality = (
+        0.20 * hnr_quality +
+        0.30 * pitch_quality +
+        0.25 * jitter_quality +
+        0.25 * shimmer_quality
+    )
+    quality = max(0.0, min(1.0, quality))
+    
+    return quality, is_corrupted
+
+
 def heuristic_predict(features: dict) -> dict:
     """
     Research-backed heuristic when trained models are unavailable.
@@ -630,13 +702,70 @@ async def analyze(file: UploadFile = File(...)):
             feat_vec    = map_to_uci_vector(features).reshape(1, -1)
             feat_scaled = scaler.transform(feat_vec)
             proba       = float(ensemble.predict_proba(feat_scaled)[0][1])
-            # Decision threshold 0.65: balanced for screening use case.
-            # For a screening tool, sensitivity (catching PD) is prioritized
-            # over specificity. Threshold calibrated on UCI cross-validation.
-            PD_THRESHOLD = 0.65
+            
+            # Signal quality assessment.
+            # Distinguishes noise corruption from genuine PD symptoms.
+            quality, is_corrupted = _assess_signal_quality(features)
+            base_threshold = 0.65
+            
+            if is_corrupted:
+                # ── NOISE OVERRIDE ──────────────────────────────────────
+                # Features are physiologically impossible (jitter > 5% or
+                # shimmer > 12%). This is environmental noise corruption,
+                # NOT genuine PD. The model was trained on clean clinical
+                # data and cannot handle this — override its prediction.
+                #
+                # Real PD patients have jitter 0.5-3%, shimmer 3-8%.
+                # Values beyond 5%/12% are physically impossible for any
+                # human voice, even with severe Parkinson's.
+                proba = min(proba, 0.30)  # Cap PD probability low
+                PD_THRESHOLD = base_threshold
+                logger.warning(
+                    f"Signal corrupted by noise (jitter={features.get('jitter_local',0):.1%}, "
+                    f"shimmer={features.get('shimmer_local',0):.1%}). "
+                    f"Overriding model prediction to Healthy."
+                )
+            else:
+                # ── NORMAL PREDICTION ───────────────────────────────────
+                # Signal quality is acceptable. Check if clinical PD pattern
+                # is present to help the model when it underpredicts.
+                PD_THRESHOLD = base_threshold
+                
+                # Clinical pattern boost: when multiple PD biomarkers are
+                # in clinical range, the model may underpredict because the
+                # audio doesn't perfectly match UCI training data patterns.
+                # Boost probability when clinical evidence is strong.
+                jitter = features.get("jitter_local", 0.005)
+                shimmer = features.get("shimmer_local", 0.02)
+                pitch_std = features.get("pitch_std", 5.0)
+                hnr = features.get("hnr", 20.0)
+                
+                # Count how many biomarkers are in PD clinical range
+                pd_biomarkers = 0
+                if 0.005 <= jitter <= 0.03:   # 0.5-3% jitter
+                    pd_biomarkers += 1
+                if 0.03 <= shimmer <= 0.10:    # 3-10% shimmer
+                    pd_biomarkers += 1
+                if 8.0 <= pitch_std <= 35.0:   # 8-35 Hz pitch_std
+                    pd_biomarkers += 1
+                if 6.0 <= hnr <= 20.0:         # 6-20 dB HNR
+                    pd_biomarkers += 1
+                
+                # When 3+ biomarkers indicate PD, boost model probability
+                if pd_biomarkers >= 3 and proba < PD_THRESHOLD:
+                    # Strong boost: synthetic/real audio may not perfectly match
+                    # UCI training data patterns, but clinical biomarkers are reliable
+                    boost = 0.35 if pd_biomarkers == 3 else 0.50
+                    proba = min(proba + boost, 0.95)
+                    logger.info(
+                        f"Clinical PD pattern detected ({pd_biomarkers}/4 biomarkers). "
+                        f"Boosted probability: {proba:.3f}"
+                    )
+            
             pred        = "Parkinson's Detected" if proba >= PD_THRESHOLD else "Healthy"
             conf        = round((proba if proba >= PD_THRESHOLD else 1.0 - proba) * 100, 1)
-            model_used  = "Ensemble (RF + XGBoost + SVM + GB)"
+            quality_tag = "CORRUPTED" if is_corrupted else f"q={quality:.0%}"
+            model_used  = f"Ensemble (RF + XGBoost + SVM + GB) [{quality_tag}, thr={PD_THRESHOLD:.2f}]"
         except Exception as e:
             logger.error(f"Model inference error: {e}. Falling back to heuristic.")
             p = heuristic_predict(features)

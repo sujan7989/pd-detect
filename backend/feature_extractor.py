@@ -24,6 +24,9 @@ def extract_features(audio_bytes: bytes, sr_target: int = 22050) -> dict:
     Returns a flat dict suitable for feeding into the UCI-mapped ML model.
     """
     y, sr = _load_audio(audio_bytes, sr_target)
+    
+    # Preprocess audio to reduce noise artifacts from real microphone recordings
+    y = _preprocess_audio(y, sr)
 
     features: dict = {}
 
@@ -39,8 +42,13 @@ def extract_features(audio_bytes: bytes, sr_target: int = 22050) -> dict:
     voiced = f0[f0 > 0]
     if len(voiced) < 2:
         voiced = np.array([150.0, 152.0])
-    features["pitch_mean"] = float(np.mean(voiced))
-    features["pitch_std"]  = float(np.std(voiced))
+    # Robust pitch statistics: use trimmed mean/std (exclude top/bottom 10%)
+    # This prevents noise-induced pitch outliers from inflating pitch_std
+    voiced_sorted = np.sort(voiced)
+    trim_n = max(1, int(len(voiced_sorted) * 0.1))
+    voiced_trimmed = voiced_sorted[trim_n:-trim_n] if len(voiced_sorted) > 2*trim_n else voiced_sorted
+    features["pitch_mean"] = float(np.mean(voiced_trimmed))
+    features["pitch_std"]  = float(np.std(voiced_trimmed))
 
     # 3. Jitter — computed from real pitch periods using zero-crossing method
     # This is more accurate than F0-contour method for browser/compressed audio
@@ -57,6 +65,10 @@ def extract_features(audio_bytes: bytes, sr_target: int = 22050) -> dict:
             periods = np.abs(periods)
         else:
             periods = np.array([1/150.0, 1/152.0, 1/148.0])
+    
+    # Robust period rejection: remove outlier periods caused by noise bursts
+    # Use IQR-based rejection (more robust than std-based for noisy data)
+    periods = _robust_period_rejection(periods)
 
     features["jitter_local"]    = _jitter_local(periods)
     features["jitter_absolute"] = float(np.mean(np.abs(np.diff(periods))))
@@ -71,6 +83,8 @@ def extract_features(audio_bytes: bytes, sr_target: int = 22050) -> dict:
     rms = rms[rms > 1e-8]
     if len(rms) < 2:
         rms = np.array([0.05, 0.052])
+    # Robust RMS rejection: remove outlier amplitudes from noise bursts
+    rms = _robust_amplitude_rejection(rms)
     features["shimmer_local"] = _shimmer_local(rms)
     features["shimmer_db"]    = _shimmer_db(rms)
     features["shimmer_apq3"]  = _shimmer_apq(rms, 3)
@@ -199,6 +213,358 @@ def _trim_and_validate(y: np.ndarray, sr: int) -> tuple:
     if len(y) < sr * 0.1:
         raise ValueError("Audio too short for analysis (< 0.1 s after trimming).")
     return y, sr
+
+
+def _preprocess_audio(y: np.ndarray, sr: int) -> np.ndarray:
+    """
+    Adaptive voice isolation pipeline for real-world microphone recordings.
+    
+    Only applies heavy noise removal when environmental noise is detected:
+    - Low-frequency rumble (vehicles, fans): energy below 60Hz
+    - High-frequency hiss: high ZCR or energy above 8kHz
+    - Tonal noise (buzzing): narrow-band spectral peaks
+    
+    For clean/moderate recordings: gentle DC removal + high-pass only.
+    This prevents preprocessing artifacts from creating false jitter.
+    """
+    from scipy.signal import butter, sosfilt
+    
+    if len(y) < sr * 0.3:
+        return y
+    
+    # ── DC removal (always needed) ────────────────────────────────────
+    y = y - np.mean(y)
+    
+    # ── Detect environmental noise ────────────────────────────────────
+    # Check for low-frequency rumble (energy below 60Hz)
+    n_fft = min(4096, len(y))
+    spectrum = np.abs(rfft(y[:n_fft]))
+    freqs = rfftfreq(n_fft, 1.0 / sr)
+    
+    low_freq_energy = np.mean(spectrum[freqs < 60] ** 2 + 1e-10)
+    voice_energy = np.mean(spectrum[(freqs >= 80) & (freqs <= 4000)] ** 2 + 1e-10)
+    rumble_ratio = low_freq_energy / (voice_energy + 1e-10)
+    
+    # Check for high-frequency hiss (energy above 6kHz)
+    high_freq_energy = np.mean(spectrum[freqs > 6000] ** 2 + 1e-10)
+    hiss_ratio = high_freq_energy / (voice_energy + 1e-10)
+    
+    # Check for tonal noise (narrow-band peaks outside voice range)
+    has_tonal_noise = False
+    if len(spectrum) > 100:
+        spec_smooth = np.convolve(spectrum, np.ones(20)/20, 'same')
+        spec_ratio = spectrum / (spec_smooth + 1e-10)
+        # Check for sharp peaks outside voice range
+        for band in [(0, 60), (6000, sr//2)]:
+            mask = (freqs >= band[0]) & (freqs < band[1]) & (freqs > 0)
+            if np.any(mask) and np.max(spec_ratio[mask]) > 5.0:
+                has_tonal_noise = True
+    
+    has_environmental_noise = rumble_ratio > 0.3 or hiss_ratio > 0.1 or has_tonal_noise
+    
+    if not has_environmental_noise:
+        # ── CLEAN/MODERATE SIGNAL: gentle processing only ─────────────
+        # High-pass filter at 60Hz to remove sub-sonic rumble
+        # (gentle 2nd order, minimal phase distortion)
+        try:
+            sos_hp = butter(2, 60, btype='high', fs=sr, output='sos')
+            y = sosfilt(sos_hp, y).astype(np.float32)
+        except Exception:
+            pass
+        
+        # Soft normalization
+        peak = np.max(np.abs(y))
+        if peak > 0.01:
+            y = y * (0.8 / peak)
+        return y
+    
+    # ── ENVIRONMENTAL NOISE DETECTED: full noise removal pipeline ─────
+    
+    # Pre-emphasis
+    y = np.append(y[0], y[1:] - 0.95 * y[:-1])
+    
+    # Adaptive noise profiling
+    noise_profile = _estimate_noise_profile(y, sr)
+    
+    # Gentle spectral subtraction (reduced aggressiveness)
+    y = _spectral_subtraction(y, sr, noise_profile, alpha=1.5, beta=0.03)
+    
+    # Temporal noise suppression
+    y = _temporal_noise_suppression(y, sr)
+    
+    # Voice band-pass filter (75Hz - 5kHz)
+    try:
+        sos_bp = butter(4, [75, 5000], btype='band', fs=sr, output='sos')
+        y = sosfilt(sos_bp, y).astype(np.float32)
+    except Exception:
+        pass
+    
+    # Harmonic enhancement
+    y = _enhance_harmonics(y, sr)
+    
+    # Soft normalization
+    peak = np.max(np.abs(y))
+    if peak > 0.01:
+        y = y * (0.7 / peak)
+    
+    return y
+
+
+def _estimate_noise_profile(y: np.ndarray, sr: int, 
+                            n_profile_frames: int = 20) -> np.ndarray:
+    """
+    Build a spectral fingerprint of background noise.
+    Finds the quietest segments of audio (non-voiced) and averages their
+    spectra to create a noise profile. This adapts to the specific
+    environment (fan hum at 60Hz, traffic rumble, AC hiss, etc.)
+    """
+    frame_len = int(sr * 0.03)  # 30ms frames
+    hop = frame_len // 2
+    n_frames = max(1, (len(y) - frame_len) // hop)
+    window = np.hanning(frame_len)
+    n_fft_bins = frame_len // 2 + 1
+    
+    # Compute energy per frame
+    frame_energies = np.zeros(n_frames)
+    frame_spectra = np.zeros((n_frames, n_fft_bins))
+    
+    for i in range(n_frames):
+        start = i * hop
+        frame = y[start:start + frame_len]
+        if len(frame) < frame_len:
+            frame = np.pad(frame, (0, frame_len - len(frame)))
+        windowed = frame * window
+        spectrum = np.abs(rfft(windowed))
+        frame_spectra[i] = spectrum
+        frame_energies[i] = np.sqrt(np.mean(frame ** 2))
+    
+    # Select the quietest frames as noise profile
+    n_select = min(n_profile_frames, n_frames)
+    quietest_idx = np.argsort(frame_energies)[:n_select]
+    
+    # Average spectrum of quietest frames = noise fingerprint
+    noise_profile = np.mean(frame_spectra[quietest_idx], axis=0)
+    
+    # Add safety floor to avoid division by zero
+    noise_profile = np.maximum(noise_profile, 1e-10)
+    
+    return noise_profile
+
+
+def _spectral_subtraction(y: np.ndarray, sr: int, 
+                          noise_profile: np.ndarray,
+                          alpha: float = 2.0,
+                          beta: float = 0.02) -> np.ndarray:
+    """
+    Remove noise by subtracting the noise spectral profile from each frame.
+    
+    Parameters:
+    - alpha: Over-subtraction factor (higher = more aggressive noise removal)
+    - beta: Spectral floor (prevents musical noise artifacts, 0.01-0.05)
+    
+    This works per-frequency-band, so it can remove tonal noise (fan hum)
+    and broadband noise (hiss) simultaneously.
+    """
+    frame_len = len(noise_profile) * 2 - 2  # Reconstruct frame length
+    hop = frame_len // 2
+    n_frames = max(1, (len(y) - frame_len) // hop + 1)
+    window = np.hanning(frame_len)
+    
+    # Noise power spectrum
+    noise_power = noise_profile ** 2
+    
+    # Output buffer
+    output = np.zeros(len(y), dtype=np.float32)
+    window_sum = np.zeros(len(y), dtype=np.float32)
+    
+    for i in range(n_frames):
+        start = i * hop
+        end = min(start + frame_len, len(y))
+        frame = y[start:end].copy()
+        if len(frame) < frame_len:
+            frame = np.pad(frame, (0, frame_len - len(frame)))
+        
+        # Windowed FFT
+        windowed = frame * window
+        fft_data = rfft(windowed)
+        power = np.abs(fft_data) ** 2
+        phase = np.angle(fft_data)
+        
+        # Spectral subtraction: |S(f)|^2 = |X(f)|^2 - alpha * |N(f)|^2
+        clean_power = power - alpha * noise_power
+        # Apply spectral floor to prevent negative power / musical noise
+        clean_power = np.maximum(clean_power, beta * power)
+        
+        # Reconstruct
+        clean_mag = np.sqrt(clean_power)
+        clean_fft = clean_mag * np.exp(1j * phase)
+        clean_frame = np.real(np.fft.irfft(clean_fft, n=frame_len))
+        
+        # Overlap-add
+        actual_end = start + frame_len
+        if actual_end > len(y):
+            actual_end = len(y)
+            clean_frame = clean_frame[:actual_end - start]
+        output[start:actual_end] += clean_frame * window[:actual_end - start]
+        window_sum[start:actual_end] += window[:actual_end - start] ** 2
+    
+    # Normalize by window overlap
+    window_sum = np.maximum(window_sum, 1e-8)
+    output /= window_sum
+    
+    return output.astype(np.float32)
+
+
+def _temporal_noise_suppression(y: np.ndarray, sr: int,
+                                 attack_ms: float = 10.0,
+                                 release_ms: float = 100.0) -> np.ndarray:
+    """
+    Time-varying noise gate that adapts to changing noise levels.
+    Uses separate attack/release time constants to avoid clicking artifacts.
+    Suppresses noise between voiced segments and during noise bursts.
+    """
+    frame_len = int(sr * 0.02)  # 20ms
+    hop = frame_len // 2
+    n_frames = max(1, (len(y) - frame_len) // hop + 1)
+    
+    # Compute per-frame energy
+    frame_energy = np.zeros(n_frames)
+    for i in range(n_frames):
+        start = i * hop
+        frame = y[start:start + frame_len]
+        frame_energy[i] = np.sqrt(np.mean(frame ** 2) + 1e-10)
+    
+    # Estimate noise floor as median of lowest 15% of frames
+    noise_floor = np.percentile(frame_energy, 15)
+    
+    # Compute gain per frame: smooth envelope follower
+    # Above threshold: gain = 1.0
+    # Below threshold: gain scales down proportionally
+    snr_threshold = noise_floor * 3.0  # 3x noise floor = voiced
+    gain = np.ones(n_frames)
+    
+    for i in range(n_frames):
+        if frame_energy[i] < snr_threshold:
+            # Soft compression below threshold
+            ratio = frame_energy[i] / (snr_threshold + 1e-10)
+            gain[i] = max(0.15, ratio ** 0.5)  # Soft knee
+    
+    # Smooth gain with asymmetric envelope (fast attack, slow release)
+    attack_samples = int(attack_ms / 1000.0 * sr / hop)
+    release_samples = int(release_ms / 1000.0 * sr / hop)
+    
+    smoothed_gain = np.copy(gain)
+    for i in range(1, n_frames):
+        if smoothed_gain[i] < smoothed_gain[i-1]:
+            # Attack (getting quieter) - fast
+            coeff = 1.0 / max(attack_samples, 1)
+            smoothed_gain[i] = smoothed_gain[i-1] + coeff * (gain[i] - smoothed_gain[i-1])
+        else:
+            # Release (getting louder) - slow
+            coeff = 1.0 / max(release_samples, 1)
+            smoothed_gain[i] = smoothed_gain[i-1] + coeff * (gain[i] - smoothed_gain[i-1])
+    
+    # Apply gain to signal (interpolate from frame-level to sample-level)
+    output = np.zeros(len(y), dtype=np.float32)
+    for i in range(n_frames):
+        start = i * hop
+        end = min(start + frame_len, len(y))
+        output[start:end] += y[start:end] * smoothed_gain[i]
+    
+    return output
+
+
+def _enhance_harmonics(y: np.ndarray, sr: int,
+                       f0_range: tuple = (75, 500)) -> np.ndarray:
+    """
+    Enhance harmonic structure of voiced speech.
+    Voice produces harmonics at integer multiples of f0.
+    Non-harmonic energy is likely noise.
+    
+    Uses a comb filter approach: strengthens frequencies at f0, 2*f0, 3*f0...
+    and attenuates frequencies between harmonics.
+    """
+    # Estimate dominant f0 from autocorrelation
+    n = min(len(y), sr * 2)  # Use up to 2 seconds
+    segment = y[:n] - np.mean(y[:n])
+    rms = np.sqrt(np.mean(segment ** 2))
+    if rms < 1e-5:
+        return y
+    
+    segment = segment / (rms + 1e-10)
+    fa = rfft(segment, n=len(segment) * 2)
+    ac = np.real(np.fft.irfft(fa * np.conj(fa)))[:len(segment)]
+    if ac[0] <= 0:
+        return y
+    ac /= ac[0]
+    
+    lag_min = int(sr / f0_range[1])
+    lag_max = int(sr / f0_range[0])
+    if lag_max >= len(ac):
+        lag_max = len(ac) - 1
+    if lag_max <= lag_min:
+        return y
+    
+    seg_ac = ac[lag_min:lag_max]
+    if len(seg_ac) == 0:
+        return y
+    peak_idx = int(np.argmax(seg_ac)) + lag_min
+    if ac[peak_idx] < 0.2:  # Weak periodicity, skip enhancement
+        return y
+    
+    f0_est = sr / peak_idx
+    
+    # Apply gentle harmonic enhancement via parallel resonators
+    # This is lightweight compared to full source separation
+    n_fft = 2048
+    hop = n_fft // 2
+    window = np.hanning(n_fft)
+    n_frames = max(1, (len(y) - n_fft) // hop + 1)
+    freqs = rfftfreq(n_fft, 1.0 / sr)
+    
+    output = np.zeros(len(y), dtype=np.float32)
+    win_sum = np.zeros(len(y), dtype=np.float32)
+    
+    # Build harmonic mask: peaks at f0, 2*f0, 3*f0, ...
+    n_harmonics = int(min(5000 / f0_est, 20))  # Up to 5kHz
+    harmonic_mask = np.zeros(len(freqs))
+    bandwidth = f0_est * 0.3  # 30% of f0 as bandwidth
+    
+    for h in range(1, n_harmonics + 1):
+        center = h * f0_est
+        if center > sr / 2:
+            break
+        # Gaussian peak at each harmonic
+        harmonic_mask += np.exp(-0.5 * ((freqs - center) / bandwidth) ** 2)
+    
+    # Normalize mask to [0.5, 1.5] range (gentle enhancement)
+    if np.max(harmonic_mask) > 0:
+        harmonic_mask = 0.5 + 1.0 * harmonic_mask / np.max(harmonic_mask)
+    else:
+        harmonic_mask = np.ones(len(freqs))
+    
+    for i in range(n_frames):
+        start = i * hop
+        end = min(start + n_fft, len(y))
+        frame = y[start:end].copy()
+        if len(frame) < n_fft:
+            frame = np.pad(frame, (0, n_fft - len(frame)))
+        
+        windowed = frame * window
+        fft_data = rfft(windowed)
+        
+        # Apply harmonic mask
+        enhanced_fft = fft_data * harmonic_mask
+        
+        enhanced_frame = np.real(np.fft.irfft(enhanced_fft, n=n_fft))
+        actual_len = end - start
+        output[start:end] += enhanced_frame[:actual_len] * window[:actual_len]
+        win_sum[start:end] += window[:actual_len] ** 2
+    
+    win_sum = np.maximum(win_sum, 1e-8)
+    output /= win_sum
+    
+    return output.astype(np.float32)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -378,6 +744,55 @@ def _compute_periods_zerocrossing(y: np.ndarray, sr: int,
 # ═══════════════════════════════════════════════════════════════════════════
 #  JITTER helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _robust_period_rejection(p: np.ndarray) -> np.ndarray:
+    """
+    Remove outlier pitch periods using IQR-based rejection.
+    Noise bursts and background sounds create spurious periods that
+    inflate jitter measurements. IQR method is robust to non-Gaussian
+    outliers (unlike std-based rejection).
+    Keeps only periods within [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
+    """
+    if len(p) < 5:
+        return p
+    q1 = np.percentile(p, 25)
+    q3 = np.percentile(p, 75)
+    iqr = q3 - q1
+    if iqr < 1e-10:
+        return p  # All periods nearly identical
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    mask = (p >= lower) & (p <= upper)
+    rejected = p[~mask]
+    kept = p[mask]
+    # Keep at least 5 periods to avoid empty arrays
+    if len(kept) < 5:
+        return p
+    return kept
+
+
+def _robust_amplitude_rejection(a: np.ndarray) -> np.ndarray:
+    """
+    Remove outlier amplitude frames using IQR-based rejection.
+    Noise bursts create high-amplitude frames that inflate shimmer.
+    Silence frames create low-amplitude frames that also inflate shimmer.
+    Keeps only amplitudes within [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
+    """
+    if len(a) < 5:
+        return a
+    q1 = np.percentile(a, 25)
+    q3 = np.percentile(a, 75)
+    iqr = q3 - q1
+    if iqr < 1e-10:
+        return a
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    mask = (a >= lower) & (a <= upper)
+    kept = a[mask]
+    if len(kept) < 5:
+        return a
+    return kept
+
 
 def _jitter_local(p: np.ndarray) -> float:
     if len(p) < 2: return 0.0
