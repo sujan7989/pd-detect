@@ -121,6 +121,24 @@ def extract_features(audio_bytes: bytes, sr_target: int = 22050) -> dict:
     features["spread2"] = float(np.log(features["jitter_local"] + 1e-8))
     features["ppe"]     = float(np.log(features["shimmer_local"] + 1e-8))
 
+    # ── SNR estimation ──────────────────────────────────────────────────────
+    try:
+        rms_all  = _frame_rms(y, int(sr * 0.025), int(sr * 0.010))
+        rms_all  = rms_all[rms_all > 1e-10]
+        if len(rms_all) >= 10:
+            rms_sorted   = np.sort(rms_all)
+            noise_floor  = float(np.mean(rms_sorted[:max(1, len(rms_sorted) // 10)]) + 1e-10)
+            signal_level = float(np.mean(rms_sorted[len(rms_sorted) // 2:]) + 1e-10)
+            snr_db       = 20.0 * np.log10(signal_level / noise_floor)
+            features["snr_db"] = float(np.clip(snr_db, -10.0, 60.0))
+        else:
+            features["snr_db"] = 20.0
+    except Exception:
+        features["snr_db"] = 20.0
+
+    # ── Duration ────────────────────────────────────────────────────────────
+    features["duration_sec"] = float(len(y) / sr)
+
     return features
 
 

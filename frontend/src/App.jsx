@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { Routes, Route, NavLink, useLocation } from "react-router-dom";
 import {
   Brain, Activity, History, BookOpen, BarChart2,
-  Menu, X, AlertTriangle, WifiOff, Loader2,
+  Menu, X, AlertTriangle, WifiOff, Loader2, Sun, Moon,
 } from "lucide-react";
 import AnalyzePage   from "./pages/AnalyzePage.jsx";
 import HistoryPage   from "./pages/HistoryPage.jsx";
@@ -22,6 +22,7 @@ export default function App() {
   const [apiStatus,   setApiStatus]   = useState("checking");
   const [mobileOpen,  setMobileOpen]  = useState(false);
   const [scrolled,    setScrolled]    = useState(false);
+  const [darkMode,    setDarkMode]    = useState(true);
   const location = useLocation();
 
   useEffect(() => { setMobileOpen(false); }, [location]);
@@ -31,6 +32,19 @@ export default function App() {
     window.addEventListener("scroll", fn);
     return () => window.removeEventListener("scroll", fn);
   }, []);
+
+  // Apply theme to body
+  useEffect(() => {
+    if (darkMode) {
+      document.body.style.background = "";
+      document.body.style.color = "";
+      document.documentElement.classList.remove("light-mode");
+    } else {
+      document.body.style.background = "#f1f5f9";
+      document.body.style.color = "#0f172a";
+      document.documentElement.classList.add("light-mode");
+    }
+  }, [darkMode]);
 
   useEffect(() => {
     const ping = async () => {
@@ -131,6 +145,20 @@ export default function App() {
 
           {/* Right side */}
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            {/* Dark/Light toggle */}
+            <button
+              onClick={() => setDarkMode(!darkMode)}
+              title={darkMode ? "Switch to Light Mode" : "Switch to Dark Mode"}
+              style={{
+                background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.12)",
+                borderRadius: 10, padding: "6px 10px", cursor: "pointer",
+                color: "rgba(255,255,255,0.7)", display: "flex", alignItems: "center",
+                gap: 5, fontSize: 12, fontWeight: 600, transition: "all 0.2s",
+              }}
+            >
+              {darkMode ? <Sun size={14} /> : <Moon size={14} />}
+              <span className="hidden sm:inline">{darkMode ? "Light" : "Dark"}</span>
+            </button>
             {/* API status badge */}
             <div
               className="hidden sm:flex"

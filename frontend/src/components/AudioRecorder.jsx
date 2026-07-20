@@ -559,6 +559,18 @@ export default function AudioRecorder({ onComplete, onStart, isAnalyzing }) {
               >
                 <Trash2 size={14} /> Discard &amp; try again
               </button>
+
+              {/* Quality tip */}
+              <div style={{
+                padding: "10px 14px", borderRadius: "12px",
+                background: "rgba(139,92,246,0.08)", border: "1px solid rgba(139,92,246,0.2)",
+                display: "flex", alignItems: "flex-start", gap: "8px",
+              }}>
+                <span style={{ fontSize: "14px", flexShrink: 0 }}>💡</span>
+                <p style={{ fontSize: "11px", color: "rgba(255,255,255,0.45)", margin: 0, lineHeight: 1.6 }}>
+                  <strong style={{ color: "rgba(139,92,246,0.9)" }}>For best results:</strong> Record in a quiet room · Say &quot;Aaah&quot; steadily for 5–10 seconds · Keep mic ~15cm from mouth · Avoid background noise
+                </p>
+              </div>
             </>
           )}
 

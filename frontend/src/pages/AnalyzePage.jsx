@@ -4,10 +4,10 @@ import AudioRecorder from "../components/AudioRecorder.jsx";
 import ResultPanel   from "../components/ResultPanel.jsx";
 
 const STATS = [
-  { value: "97.4%",  label: "Model Accuracy",     color: "text-emerald-400" },
-  { value: "60+",    label: "Acoustic Features",   color: "text-violet-400"  },
-  { value: "3",      label: "ML Models Ensemble",  color: "text-cyan-400"    },
-  { value: "<5s",    label: "Analysis Speed",      color: "text-amber-400"   },
+  { value: "92.3%",  label: "Model Accuracy (CV)",  color: "text-emerald-400" },
+  { value: "68+",    label: "Acoustic Features",     color: "text-violet-400"  },
+  { value: "4",      label: "ML Models Ensemble",    color: "text-cyan-400"    },
+  { value: "<10s",   label: "Analysis Speed",        color: "text-amber-400"   },
 ];
 
 export default function AnalyzePage({ apiStatus }) {
@@ -57,8 +57,8 @@ export default function AnalyzePage({ apiStatus }) {
 
           {/* Feature pills */}
           <div className="flex flex-wrap justify-center gap-2">
-            {["Live Waveform", "Real-time Analysis", "PDF Report", "60+ Features", "3-Model Ensemble"].map((f) => (
-              <span key={f} className="glass px-3 py-1.5 rounded-full text-xs text-white/50 font-medium border border-white/8">
+            {["Live Waveform", "Audio Quality Check", "SNR Analysis", "Noise Reduction", "68+ Features", "4-Model Ensemble", "PDF Report"].map((f) => (
+              <span key={f} className="glass px-3 py-1.5 rounded-full text-xs text-white/50 font-medium" style={{ border: "1px solid rgba(255,255,255,0.08)" }}>
                 {f}
               </span>
             ))}

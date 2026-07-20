@@ -431,10 +431,11 @@ def heuristic_predict(features: dict) -> dict:
 
 
 def risk_level(prob: float) -> str:
-    # Threshold aligned with PD_THRESHOLD=0.65
-    if prob >= 0.75: return "High"
-    if prob >= 0.65: return "Medium"
-    return "Low"
+    if prob >= 0.80: return "Very High"
+    if prob >= 0.65: return "High"
+    if prob >= 0.45: return "Moderate"
+    if prob >= 0.25: return "Low"
+    return "Very Low"
 
 
 def get_recommendations(prediction: str, confidence: float, features: dict) -> list:
@@ -774,9 +775,16 @@ async def analyze(file: UploadFile = File(...)):
             logger.error(f"Model inference error: {e}. Falling back to heuristic.")
             p = heuristic_predict(features)
             pred, proba, conf, model_used = p["prediction"], p["probability"], p["confidence"], p["model_used"]
+            quality, is_corrupted = 0.7, False
     else:
         p = heuristic_predict(features)
         pred, proba, conf, model_used = p["prediction"], p["probability"], p["confidence"], p["model_used"]
+        quality, is_corrupted = 0.7, False
+
+    try:
+        quality_val, corrupted_val = _assess_signal_quality(features)
+    except Exception:
+        quality_val, corrupted_val = 0.7, False
 
     recs = get_recommendations(pred, conf, features)
     fimp = build_feature_importance(features)
@@ -787,7 +795,11 @@ async def analyze(file: UploadFile = File(...)):
         "prediction":        pred,
         "confidence":        conf,
         "probability":       round(proba, 4),
+        "risk_percent":      round(proba * 100, 1),
         "risk_level":        risk_level(proba),
+        "quality_score":     round(quality_val * 100, 1),
+        "is_corrupted":      corrupted_val,
+        "snr_db":            round(float(features.get("snr_db", 0.0)), 1),
         "features":          {k: round(float(v), 6) for k, v in features.items()},
         "feature_importance":fimp,
         "recommendations":   recs,
@@ -799,6 +811,40 @@ async def analyze(file: UploadFile = File(...)):
         analysis_history.pop(0)
 
     return result
+
+
+@app.post("/validate-audio")
+async def validate_audio(file: UploadFile = File(...)):
+    """Quick audio quality check without running full ML pipeline."""
+    audio_bytes = await file.read()
+    if len(audio_bytes) < 200:
+        raise HTTPException(status_code=400, detail="File too small.")
+    try:
+        features = extract_features(audio_bytes)
+        quality, is_corrupted = _assess_signal_quality(features)
+        snr = features.get("snr_db", 0.0)
+        duration = features.get("duration_sec", 0.0)
+
+        issues = []
+        if is_corrupted:
+            issues.append("High background noise detected — results may be unreliable")
+        if duration < 2.0:
+            issues.append("Recording too short — please record for at least 3-5 seconds")
+        if snr < 10:
+            issues.append("Low signal-to-noise ratio — record in a quieter environment")
+        if features.get("zcr_mean", 0) > 0.3:
+            issues.append("Possible non-voice audio detected")
+
+        return {
+            "quality_score": round(quality * 100, 1),
+            "is_corrupted":  is_corrupted,
+            "snr_db":        round(float(snr), 1),
+            "duration_sec":  round(float(duration), 2),
+            "issues":        issues,
+            "recommendation": "Good quality — proceed with analysis" if quality > 0.6 and not issues else "Please re-record in a quieter environment",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Audio validation failed: {str(e)}")
 
 
 @app.get("/history")

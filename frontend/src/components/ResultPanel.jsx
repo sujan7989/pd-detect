@@ -133,7 +133,39 @@ export default function ResultPanel({ result }) {
                     <Cpu className="w-3 h-3" />
                     {result.model_used?.includes("Ensemble") ? "Ensemble Model" : result.model_used || "ensemble"}
                   </span>
+                  {/* Recording quality badge */}
+                  {result.quality_score !== undefined && (
+                    <span style={{
+                      display: "inline-flex", alignItems: "center", gap: "5px",
+                      padding: "3px 10px", borderRadius: "20px", fontSize: "11px", fontWeight: 700,
+                      background: result.quality_score >= 70 ? "rgba(16,185,129,0.15)" : result.quality_score >= 40 ? "rgba(251,191,36,0.15)" : "rgba(244,63,94,0.15)",
+                      border: `1px solid ${result.quality_score >= 70 ? "rgba(16,185,129,0.4)" : result.quality_score >= 40 ? "rgba(251,191,36,0.4)" : "rgba(244,63,94,0.4)"}`,
+                      color: result.quality_score >= 70 ? "#34d399" : result.quality_score >= 40 ? "#fbbf24" : "#f87171",
+                    }}>
+                      🎙 Quality: {result.quality_score}%
+                    </span>
+                  )}
+                  {/* SNR badge */}
+                  {result.snr_db !== undefined && result.snr_db > 0 && (
+                    <span style={{
+                      display: "inline-flex", alignItems: "center", gap: "5px",
+                      padding: "3px 10px", borderRadius: "20px", fontSize: "11px", fontWeight: 700,
+                      background: "rgba(139,92,246,0.12)", border: "1px solid rgba(139,92,246,0.3)", color: "#a78bfa",
+                    }}>
+                      SNR: {result.snr_db} dB
+                    </span>
+                  )}
                 </div>
+
+                {/* Corrupted recording warning */}
+                {result.is_corrupted && (
+                  <div style={{ marginTop: "12px", background: "rgba(251,191,36,0.1)", border: "1px solid rgba(251,191,36,0.3)", borderRadius: "12px", padding: "10px 14px", display: "flex", alignItems: "flex-start", gap: "8px" }}>
+                    <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                    <p style={{ fontSize: "12px", color: "#fbbf24", margin: 0, lineHeight: 1.5 }}>
+                      <strong>Recording Quality Warning:</strong> High background noise detected. Please re-record in a quieter environment for most accurate results.
+                    </p>
+                  </div>
+                )}
 
                 <div className="flex items-center gap-4 mt-3">
                   <span className="text-xs text-white/25 flex items-center gap-1.5">
